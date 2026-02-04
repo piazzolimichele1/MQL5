@@ -1,0 +1,760 @@
+#property strict
+#property copyright "Michele Piazzoli"
+#property version   "1.1"
+#property description "NewsFilter EA - Forex Factory News Impact Filter"
+#property description "Downloads economic calendar, closes all positions and blocks trading around high-impact events"
+#property description "Dashboard with countdown, GO/NOTGO signal and next news preview"
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  INPUT PARAMETERS
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// ── Timezone ──
+input int         InpTimezoneOffset       = -1;              // Timezone Offset (hours from broker time)
+
+// ── News Impact Filter ──
+input bool        InpFilterLow            = false;           // Filter Low Impact (Yellow)
+input bool        InpFilterMedium         = true;            // Filter Medium Impact (Orange)
+input bool        InpFilterHigh           = true;            // Filter High Impact (Red)
+
+// ── News Timing ──
+input int         InpMinutesBefore        = 2;               // Stop Trading X Minutes Before News
+input int         InpMinutesAfter         = 2;               // Resume Trading X Minutes After News
+input int         InpSlippage             = 10;              // Max Slippage (points)
+
+// ── Currency Filter ──
+input string      InpCurrencies           = "ALL";           // Currencies to Monitor (ALL or comma separated: USD,EUR,GBP)
+
+// ── Data Refresh ──
+input int         InpRefreshMinutes       = 10;              // Refresh Calendar Every X Minutes
+
+// ── Dashboard Position ──
+input int         InpDashboardX           = 20;              // Dashboard X Position
+input int         InpDashboardY           = 50;              // Dashboard Y Position
+input int         InpDashboardWidth       = 700;             // Dashboard Width
+input int         InpDashboardHeight      = 300;             // Dashboard Height
+
+// ── Dashboard Style ──
+input color       InpDashBgColor          = clrBlack;        // Dashboard Background Color
+input color       InpDashBorderColor      = clrDarkGray;     // Dashboard Border Color
+input color       InpDashTitleColor       = clrWhite;        // Title Text Color
+input color       InpDashLabelColor       = clrSilver;       // Label Text Color
+input color       InpDashValueColor       = clrAqua;         // Value Text Color
+input string      InpDashFont             = "Arial";         // Dashboard Font
+input int         InpDashTitleSize        = 18;              // Title Font Size
+input int         InpDashLabelSize        = 14;              // Label Font Size
+input int         InpDashRowSpacing       = 20;              // Vertical Spacing Between Rows
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  NEWS EVENT STRUCTURE
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+struct NewsEvent
+{
+   datetime eventTime;        // Event datetime in broker time
+   string   title;            // Event title (e.g. "Non-Farm Payrolls")
+   string   currency;         // Currency affected (e.g. "USD")
+   string   impact;           // Impact level: "Low", "Medium", "High"
+   color    impactColor;      // Display color: yellow, orange, red
+};
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  GLOBAL VARIABLES
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+NewsEvent g_newsEvents[];              // Array of all loaded news events for today
+int       g_newsCount         = 0;     // Total number of loaded events
+datetime  g_lastDataRefresh   = 0;     // Last calendar data download timestamp
+bool      g_isTradeBlocked    = false; // Current trade block status (true = NOTGO)
+bool      g_alreadyClosed     = false; // True after positions closed for current NOTGO window
+string    g_nextNewsTitle     = "—";   // Next upcoming news title for dashboard
+string    g_nextNewsTime      = "—";   // Next upcoming news time string for dashboard
+string    g_nextNewsImpact    = "—";   // Next upcoming news impact level for dashboard
+color     g_nextNewsColor     = clrWhite; // Next news impact color for dashboard
+string    g_countdownStr      = "—";   // Countdown string for dashboard display
+string    g_dataStatus        = "NOT LOADED"; // Calendar data load status
+string    g_csvFileName       = "newsfilter_calendar.csv"; // CSV filename for calendar data
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 1/16 — GetLocalTime
+//  Applies timezone offset to broker time and returns adjusted local datetime
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+datetime GetLocalTime()
+{
+   return TimeCurrent() + (InpTimezoneOffset * 3600);
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 2/16 — OnInit
+//  Expert Advisor initialization: downloads calendar, builds dashboard, starts monitoring
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+int OnInit()
+{
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  NEWSFILTER EA 1.0 — Michele Piazzoli");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   Print("[INIT] Timezone Offset: ", InpTimezoneOffset, " hours");
+   Print("[INIT] Filter Low:      ", InpFilterLow ? "ON" : "OFF");
+   Print("[INIT] Filter Medium:   ", InpFilterMedium ? "ON" : "OFF");
+   Print("[INIT] Filter High:     ", InpFilterHigh ? "ON" : "OFF");
+   Print("[INIT] Stop Before:     ", InpMinutesBefore, " minutes");
+   Print("[INIT] Resume After:    ", InpMinutesAfter, " minutes");
+   Print("[INIT] Currencies:      ", InpCurrencies);
+
+   ArrayResize(g_newsEvents, 0);
+   g_newsCount = 0;
+
+   DownloadCalendar();
+   CreateDashboard();
+   UpdateNewsStatus();
+   UpdateDashboard();
+
+   EventSetTimer(60);  // Update every 60 seconds
+
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  EA READY — News monitoring active");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   return INIT_SUCCEEDED;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 3/16 — OnDeinit
+//  Expert Advisor shutdown: removes dashboard objects and kills timer
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void OnDeinit(const int reason)
+{
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  NEWSFILTER EA 1.0 — SHUTDOWN");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   EventKillTimer();
+   DeleteDashboard();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 4/16 — OnTick
+//  Main loop on every price tick: refreshes data if needed, updates news status and dashboard
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void OnTick()
+{
+   CheckDataRefresh();
+   UpdateNewsStatus();
+   UpdateDashboard();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 5/16 — OnTimer
+//  Timer callback every 30 seconds: same as OnTick to keep dashboard alive even without ticks
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void OnTimer()
+{
+   CheckDataRefresh();
+   UpdateNewsStatus();
+   UpdateDashboard();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 6/16 — DownloadCalendar
+//  Downloads this week's Forex Factory calendar XML, parses it and stores events in g_newsEvents
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void DownloadCalendar()
+{
+   string url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml";
+   string cookie = "";
+   string referer = "";
+   int    timeout = 10000;
+
+   char   data[];
+   char   result[];
+   string headers;
+
+   int res = WebRequest("GET", url, cookie, referer, timeout, data, 0, result, headers);
+
+   if(res == -1)
+   {
+      int error = GetLastError();
+      Print("[WARNING] WebRequest not available. Error: ", error);
+      Print("[WARNING] Add URL in Tools > Options > Expert Advisors: https://nfs.faireconomy.media");
+      g_dataStatus = "NO CONNECTION";
+      g_isTradeBlocked = true;
+      return;
+   }
+
+   if(res != 200)
+   {
+      if(res == 429)
+      {
+         Print("[CALENDAR] Rate limited (429) — will retry at next refresh interval");
+         g_lastDataRefresh = TimeCurrent();  // Reset timer to avoid hammering
+      }
+      else
+      {
+         Print("[WARNING] HTTP response code: ", res);
+         g_dataStatus = "HTTP " + IntegerToString(res);
+         g_isTradeBlocked = true;
+      }
+      return;
+   }
+
+   string xmlContent = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+
+   if(StringLen(xmlContent) < 50)
+   {
+      Print("[WARNING] Response too short");
+      g_dataStatus = "EMPTY RESPONSE";
+      g_isTradeBlocked = true;
+      return;
+   }
+
+   Print("[CALENDAR] Received ", StringLen(xmlContent), " chars");
+
+   ParseCalendarXML(xmlContent);
+   g_lastDataRefresh = TimeCurrent();
+
+   if(g_newsCount == 0)
+      g_dataStatus = "LOADED (no filtered events this week)";
+   else
+      g_dataStatus = "LOADED (" + IntegerToString(g_newsCount) + " events)";
+
+   Print("[CALENDAR] Loaded: ", g_newsCount, " filtered events");
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 7/16 — ParseCalendarXML
+//  Parses Forex Factory XML feed and extracts events matching impact and currency filters
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void ParseCalendarXML(string xml)
+{
+   ArrayResize(g_newsEvents, 0);
+   g_newsCount = 0;
+
+   // Remove newlines and carriage returns to normalize XML
+   StringReplace(xml, "\r", "");
+   StringReplace(xml, "\n", "");
+
+   int totalEvents = 0;
+   int searchPos = 0;
+
+   while(true)
+   {
+      // Find next <event> block
+      int eventStart = StringFind(xml, "<event>", searchPos);
+      if(eventStart == -1)
+         break;
+
+      int eventEnd = StringFind(xml, "</event>", eventStart);
+      if(eventEnd == -1)
+         break;
+
+      string eventBlock = StringSubstr(xml, eventStart, eventEnd - eventStart + 8);
+      searchPos = eventEnd + 8;
+      totalEvents++;
+
+      // Extract fields
+      string title    = ExtractXMLTag(eventBlock, "title");
+      string country  = ExtractXMLTag(eventBlock, "country");
+      string dateStr  = ExtractXMLTag(eventBlock, "date");
+      string timeStr  = ExtractXMLTag(eventBlock, "time");
+      string impact   = ExtractXMLTag(eventBlock, "impact");
+
+      // Trim whitespace
+      StringTrimLeft(title);    StringTrimRight(title);
+      StringTrimLeft(country);  StringTrimRight(country);
+      StringTrimLeft(dateStr);  StringTrimRight(dateStr);
+      StringTrimLeft(timeStr);  StringTrimRight(timeStr);
+      StringTrimLeft(impact);   StringTrimRight(impact);
+
+      // Log first 3 events for verification
+      if(totalEvents <= 3)
+         Print("[CALENDAR] Event #", totalEvents, ": ", country, " | ", impact, " | ", title, " | ", dateStr, " ", timeStr);
+
+      // Skip events with no time (tentative / all day)
+      if(timeStr == "" || timeStr == "Tentative" || timeStr == "All Day")
+         continue;
+
+      // Filter by impact
+      if(!PassesImpactFilter(impact))
+         continue;
+
+      // Filter by currency
+      if(!PassesCurrencyFilter(country))
+         continue;
+
+      // Parse datetime
+      datetime eventTime = ParseFFDateTime(dateStr, timeStr);
+      if(eventTime == 0)
+         continue;
+
+      // Store event
+      ArrayResize(g_newsEvents, g_newsCount + 1);
+      g_newsEvents[g_newsCount].eventTime   = eventTime;
+      g_newsEvents[g_newsCount].title       = title;
+      g_newsEvents[g_newsCount].currency    = country;
+      g_newsEvents[g_newsCount].impact      = impact;
+      g_newsEvents[g_newsCount].impactColor = GetImpactColor(impact);
+      g_newsCount++;
+   }
+
+   Print("[CALENDAR] Total events: ", totalEvents, " | Filtered: ", g_newsCount);
+
+   // Sort events by time
+   SortEventsByTime();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 8/16 — ExtractXMLTag
+//  Extracts the text content between opening and closing XML tags from a string
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+string ExtractXMLTag(string xml, string tag)
+{
+   string openTag  = "<" + tag + ">";
+   string closeTag = "</" + tag + ">";
+
+   int start = StringFind(xml, openTag);
+   if(start == -1)
+      return "";
+
+   start += StringLen(openTag);
+   int end = StringFind(xml, closeTag, start);
+
+   if(end == -1)
+      return "";
+
+   string value = StringSubstr(xml, start, end - start);
+
+   // Strip CDATA wrapper: <![CDATA[value]]>
+   StringReplace(value, "<![CDATA[", "");
+   StringReplace(value, "]]>", "");
+   StringTrimLeft(value);
+   StringTrimRight(value);
+
+   return value;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 9/16 — ParseFFDateTime
+//  Converts Forex Factory date (MM-DD-YYYY) and time (HH:MMAM/PM) strings into MQL5 datetime
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+datetime ParseFFDateTime(string dateStr, string timeStr)
+{
+   // Date format: MM-DD-YYYY
+   string dateParts[];
+   if(StringSplit(dateStr, '-', dateParts) != 3)
+      return 0;
+
+   int month = (int)StringToInteger(dateParts[0]);
+   int day   = (int)StringToInteger(dateParts[1]);
+   int year  = (int)StringToInteger(dateParts[2]);
+
+   // Time format: HH:MMAM or HH:MMPM (e.g. "8:30AM", "2:00PM")
+   bool isPM = (StringFind(timeStr, "pm") >= 0 || StringFind(timeStr, "PM") >= 0);
+   bool isAM = (StringFind(timeStr, "am") >= 0 || StringFind(timeStr, "AM") >= 0);
+
+   StringReplace(timeStr, "am", "");
+   StringReplace(timeStr, "AM", "");
+   StringReplace(timeStr, "pm", "");
+   StringReplace(timeStr, "PM", "");
+
+   string timeParts[];
+   if(StringSplit(timeStr, ':', timeParts) < 2)
+      return 0;
+
+   int hour = (int)StringToInteger(timeParts[0]);
+   int min  = (int)StringToInteger(timeParts[1]);
+
+   // Convert 12h to 24h format
+   if(isPM && hour != 12)
+      hour += 12;
+   if(isAM && hour == 12)
+      hour = 0;
+
+   // FF times are in Eastern Time (ET), convert to broker time
+   // ET is GMT-5 (standard) or GMT-4 (DST)
+   // Approximate: add 7 hours for GMT+2 broker (adjust via timezone offset if needed)
+   MqlDateTime dt;
+   ZeroMemory(dt);
+   dt.year  = year;
+   dt.mon   = month;
+   dt.day   = day;
+   dt.hour  = hour;
+   dt.min   = min;
+   dt.sec   = 0;
+
+   datetime eventTime = StructToTime(dt);
+
+   // Convert ET to broker time: ET is ~GMT-5, typical broker is GMT+2 = +7h offset
+   // Then apply user timezone offset to align with broker
+   eventTime += 7 * 3600;  // ET to GMT+2 broker
+
+   return eventTime;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 10/16 — PassesImpactFilter
+//  Returns true if the event impact matches user-selected impact levels
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+bool PassesImpactFilter(string impact)
+{
+   if(impact == "Low"    && InpFilterLow)    return true;
+   if(impact == "Medium" && InpFilterMedium) return true;
+   if(impact == "High"   && InpFilterHigh)   return true;
+
+   return false;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 11/16 — PassesCurrencyFilter
+//  Returns true if the event currency is in the user's currency filter list or filter is set to ALL
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+bool PassesCurrencyFilter(string currency)
+{
+   if(InpCurrencies == "ALL" || InpCurrencies == "all" || InpCurrencies == "All")
+      return true;
+
+   // Check if currency exists in comma-separated list
+   string upper = InpCurrencies;
+   StringToUpper(upper);
+
+   string currUpper = currency;
+   StringToUpper(currUpper);
+
+   return (StringFind(upper, currUpper) >= 0);
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 12/16 — GetImpactColor
+//  Returns the display color for a given impact level string
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+color GetImpactColor(string impact)
+{
+   if(impact == "High")   return clrRed;
+   if(impact == "Medium") return clrOrange;
+   if(impact == "Low")    return clrYellow;
+
+   return clrWhite;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 13/16 — SortEventsByTime
+//  Sorts the g_newsEvents array in ascending chronological order using bubble sort
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void SortEventsByTime()
+{
+   for(int i = 0; i < g_newsCount - 1; i++)
+   {
+      for(int j = 0; j < g_newsCount - i - 1; j++)
+      {
+         if(g_newsEvents[j].eventTime > g_newsEvents[j + 1].eventTime)
+         {
+            NewsEvent temp        = g_newsEvents[j];
+            g_newsEvents[j]       = g_newsEvents[j + 1];
+            g_newsEvents[j + 1]   = temp;
+         }
+      }
+   }
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 14/16 — CheckDataRefresh
+//  Re-downloads calendar data when the refresh interval has elapsed
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CheckDataRefresh()
+{
+   if((TimeCurrent() - g_lastDataRefresh) >= InpRefreshMinutes * 60)
+      DownloadCalendar();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 15/16 — UpdateNewsStatus
+//  Finds the next upcoming news event and determines GO/NOTGO trade block status
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void UpdateNewsStatus()
+{
+   datetime now = TimeCurrent();
+
+   g_isTradeBlocked = false;
+   g_nextNewsTitle  = "—";
+   g_nextNewsTime   = "—";
+   g_nextNewsImpact = "—";
+   g_nextNewsColor  = clrWhite;
+   g_countdownStr   = "—";
+
+   // Check all events for trade block windows
+   for(int i = 0; i < g_newsCount; i++)
+   {
+      datetime blockStart = g_newsEvents[i].eventTime - (InpMinutesBefore * 60);
+      datetime blockEnd   = g_newsEvents[i].eventTime + (InpMinutesAfter * 60);
+
+      // If we are inside any block window, set NOTGO
+      if(now >= blockStart && now <= blockEnd)
+      {
+         g_isTradeBlocked = true;
+
+         // Close all positions once when entering NOTGO window
+         if(!g_alreadyClosed && PositionsTotal() > 0)
+         {
+            Print("[NEWSFILTER] NOTGO triggered — Closing all open positions");
+            CloseAllPositions();
+            g_alreadyClosed = true;
+         }
+
+         // Show this event as the active blocker
+         g_nextNewsTitle  = g_newsEvents[i].currency + " — " + g_newsEvents[i].title;
+         g_nextNewsImpact = g_newsEvents[i].impact;
+         g_nextNewsColor  = g_newsEvents[i].impactColor;
+
+         MqlDateTime dt;
+         TimeToStruct(g_newsEvents[i].eventTime + (InpTimezoneOffset * 3600), dt);
+         g_nextNewsTime = StringFormat("%02d:%02d", dt.hour, dt.min);
+
+         // Countdown to block end
+         int remaining = (int)(blockEnd - now);
+         int mins = remaining / 60;
+         int secs = remaining % 60;
+         g_countdownStr = "NOTGO ends in " + IntegerToString(mins) + "m " + IntegerToString(secs) + "s";
+
+         return;  // First active block found, no need to check more
+      }
+   }
+
+   // No active block — reset close flag and find the next upcoming event
+   g_alreadyClosed = false;
+
+   for(int i = 0; i < g_newsCount; i++)
+   {
+      if(g_newsEvents[i].eventTime > now)
+      {
+         g_nextNewsTitle  = g_newsEvents[i].currency + " — " + g_newsEvents[i].title;
+         g_nextNewsImpact = g_newsEvents[i].impact;
+         g_nextNewsColor  = g_newsEvents[i].impactColor;
+
+         MqlDateTime dt;
+         TimeToStruct(g_newsEvents[i].eventTime + (InpTimezoneOffset * 3600), dt);
+         g_nextNewsTime = StringFormat("%02d:%02d", dt.hour, dt.min);
+
+         // Countdown to news event
+         int remaining = (int)(g_newsEvents[i].eventTime - now);
+         int hours = remaining / 3600;
+         int mins  = (remaining % 3600) / 60;
+         int secs  = remaining % 60;
+
+         if(hours > 0)
+            g_countdownStr = IntegerToString(hours) + "h " + IntegerToString(mins) + "m";
+         else
+            g_countdownStr = IntegerToString(mins) + "m " + IntegerToString(secs) + "s";
+
+         return;
+      }
+   }
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 16/17 — CloseAllPositions
+//  Closes every open position immediately when NOTGO triggers
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CloseAllPositions()
+{
+   int closed = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      string symbol           = PositionGetString(POSITION_SYMBOL);
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double volume           = PositionGetDouble(POSITION_VOLUME);
+      double profit           = PositionGetDouble(POSITION_PROFIT);
+
+      MqlTradeRequest request;
+      MqlTradeResult  result;
+      ZeroMemory(request);
+      ZeroMemory(result);
+
+      request.action       = TRADE_ACTION_DEAL;
+      request.position     = ticket;
+      request.symbol       = symbol;
+      request.volume       = volume;
+      request.type         = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+      request.price        = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+      request.deviation    = InpSlippage;
+      request.comment      = "";
+      request.type_filling = ORDER_FILLING_FOK;
+
+      if(OrderSend(request, result) && result.retcode == TRADE_RETCODE_DONE)
+      {
+         Print("[OK] Closed ticket ", ticket, " | P/L: $", DoubleToString(profit, 2));
+         closed++;
+      }
+      else
+      {
+         Print("[WARNING] Ticket ", ticket, " | Retcode: ", result.retcode);
+      }
+   }
+
+   Print("[NEWSFILTER] Closed ", closed, " position(s) before news event");
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 17/17 — Dashboard Functions
+//  Creates, updates and deletes all dashboard visual objects on the chart
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CreateDashboard()
+{
+   int x  = InpDashboardX;
+   int y  = InpDashboardY;
+   int w  = InpDashboardWidth;
+   int h  = InpDashboardHeight;
+   int sp = InpDashRowSpacing;
+
+   // ── Background panel ──
+   if(ObjectFind(0, "MP_BG") >= 0) ObjectDelete(0, "MP_BG");
+   ObjectCreate(0, "MP_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_XDISTANCE,   x);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_YDISTANCE,   y);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_XSIZE,       w);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_YSIZE,       h);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_BGCOLOR,     InpDashBgColor);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_COLOR,       InpDashBorderColor);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_WIDTH,       2);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_BACK,        false);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_SELECTABLE,  false);
+
+   // ── Title ──
+   int titleY = y + 25;
+   CreateLabel("MP_TITLE", "MICHELE PIAZZOLI", x + 20, titleY, InpDashTitleColor, InpDashTitleSize, InpDashFont + " Bold");
+
+   // ── Separator ──
+   int sepY = titleY + InpDashTitleSize + 18;
+   if(ObjectFind(0, "MP_SEP1") >= 0) ObjectDelete(0, "MP_SEP1");
+   ObjectCreate(0, "MP_SEP1", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_XDISTANCE,  x + 15);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_YDISTANCE,  sepY);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_XSIZE,      w - 30);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_YSIZE,      1);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_BGCOLOR,    InpDashBorderColor);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_COLOR,      InpDashBorderColor);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_BACK,       false);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_SELECTABLE, false);
+
+   // ── GO/NOTGO Signal ──
+   int signalY = sepY + 25;
+   CreateLabel("MP_LBL_SIGNAL", "Signal:",        x + 20, signalY, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_SIGNAL", "● GO",           x + 250, signalY, clrLime, InpDashLabelSize + 4, InpDashFont + " Bold");
+
+   // ── Data rows ──
+   int row1Y = signalY + sp + 10;
+   int row2Y = row1Y + sp;
+   int row3Y = row2Y + sp;
+   int row4Y = row3Y + sp;
+   int row5Y = row4Y + sp;
+   int valX  = x + 250;
+
+   // Row 1: Data Status
+   CreateLabel("MP_LBL_DATA",   "Calendar:",       x + 20, row1Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_DATA",   g_dataStatus,      valX,   row1Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 2: Next News
+   CreateLabel("MP_LBL_NEWS",   "Next News:",      x + 20, row2Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_NEWS",   "—",               valX,   row2Y, InpDashValueColor, InpDashLabelSize, InpDashFont);
+
+   // Row 3: News Time
+   CreateLabel("MP_LBL_TIME",   "News Time:",      x + 20, row3Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_TIME",   "—",               valX,   row3Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 4: Impact
+   CreateLabel("MP_LBL_IMPACT", "Impact:",         x + 20, row4Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_IMPACT", "—",               valX,   row4Y, clrWhite,          InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 5: Countdown
+   CreateLabel("MP_LBL_COUNT",  "Countdown:",      x + 20, row5Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_COUNT",  "—",               valX,   row5Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+}
+
+void UpdateDashboard()
+{
+   // GO / NOTGO signal
+   if(g_isTradeBlocked)
+   {
+      ObjectSetString(0, "MP_VAL_SIGNAL", OBJPROP_TEXT, "● NOTGO");
+      ObjectSetInteger(0, "MP_VAL_SIGNAL", OBJPROP_COLOR, clrRed);
+   }
+   else
+   {
+      ObjectSetString(0, "MP_VAL_SIGNAL", OBJPROP_TEXT, "● GO");
+      ObjectSetInteger(0, "MP_VAL_SIGNAL", OBJPROP_COLOR, clrLime);
+   }
+
+   // Data status
+   ObjectSetString(0, "MP_VAL_DATA", OBJPROP_TEXT, g_dataStatus);
+
+   // Next news
+   ObjectSetString(0, "MP_VAL_NEWS", OBJPROP_TEXT, g_nextNewsTitle);
+
+   // News time
+   ObjectSetString(0, "MP_VAL_TIME", OBJPROP_TEXT, g_nextNewsTime);
+
+   // Impact with color
+   ObjectSetString(0, "MP_VAL_IMPACT", OBJPROP_TEXT, g_nextNewsImpact);
+   ObjectSetInteger(0, "MP_VAL_IMPACT", OBJPROP_COLOR, g_nextNewsColor);
+
+   // Countdown
+   ObjectSetString(0, "MP_VAL_COUNT", OBJPROP_TEXT, g_countdownStr);
+
+   ChartRedraw(0);
+}
+
+void DeleteDashboard()
+{
+   string objects[] = {
+      "MP_BG", "MP_TITLE", "MP_SEP1",
+      "MP_LBL_SIGNAL", "MP_VAL_SIGNAL",
+      "MP_LBL_DATA",   "MP_VAL_DATA",
+      "MP_LBL_NEWS",   "MP_VAL_NEWS",
+      "MP_LBL_TIME",   "MP_VAL_TIME",
+      "MP_LBL_IMPACT", "MP_VAL_IMPACT",
+      "MP_LBL_COUNT",  "MP_VAL_COUNT"
+   };
+
+   for(int i = 0; i < ArraySize(objects); i++)
+      ObjectDelete(0, objects[i]);
+}
+
+void CreateLabel(string name, string text, int x, int y, color clr, int size, string font)
+{
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,     clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  size);
+   ObjectSetString(0, name, OBJPROP_FONT,       font);
+   ObjectSetString(0, name, OBJPROP_TEXT,        text);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR,    ANCHOR_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_BACK,      false);
+}
