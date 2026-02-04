@@ -1,0 +1,197 @@
+#property strict
+#property copyright "Michele Piazzoli"
+#property version   "1.0"
+#property description "MACD Momentum Strategy"
+#property description "Trades MACD signal line crossovers with histogram momentum confirmation"
+#property description "Includes SL, TP, trailing stop and global variable block check"
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  INPUT PARAMETERS
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+input int         InpTimezoneOffset       = -1;
+input int         InpMACDFast             = 12;              // MACD Fast EMA Period
+input int         InpMACDSlow             = 26;              // MACD Slow EMA Period
+input int         InpMACDSignal           = 9;               // MACD Signal Period
+input int         InpEmaTrend             = 200;             // Trend EMA Period
+input bool        InpUseTrendFilter       = true;            // Use EMA 200 Trend Filter
+input ENUM_TIMEFRAMES InpTimeframe        = PERIOD_H1;       // Strategy Timeframe
+input double      InpLotSize              = 0.01;            // Lot Size
+input int         InpStopLoss             = 300;             // Stop Loss (points)
+input int         InpTakeProfit           = 600;             // Take Profit (points)
+input int         InpTrailingStop         = 150;             // Trailing Stop (points, 0 = disabled)
+input int         InpSlippage             = 10;              // Max Slippage (points)
+input int         InpMagicNumber          = 1003;            // Magic Number
+input int         InpStartHour            = 8;               // Trading Start Hour
+input int         InpEndHour              = 20;              // Trading End Hour
+
+input int         InpDashboardX           = 20;
+input int         InpDashboardY           = 50;
+input int         InpDashboardWidth       = 700;
+input int         InpDashboardHeight      = 300;
+input color       InpDashBgColor          = clrBlack;
+input color       InpDashBorderColor      = clrDarkGray;
+input color       InpDashTitleColor       = clrWhite;
+input color       InpDashLabelColor       = clrSilver;
+input color       InpDashValueColor       = clrAqua;
+input string      InpDashFont             = "Arial";
+input int         InpDashTitleSize        = 18;
+input int         InpDashLabelSize        = 14;
+input int         InpDashRowSpacing       = 20;
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  GLOBAL VARIABLES
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+int      g_handleMACD    = INVALID_HANDLE;
+int      g_handleTrend   = INVALID_HANDLE;
+int      g_totalTrades   = 0;
+string   g_lastSignal    = "—";
+string   g_lastTradeTime = "—";
+
+datetime GetLocalTime() { return TimeCurrent()+(InpTimezoneOffset*3600); }
+bool IsTradingBlocked() { double v=0; if(GlobalVariableGet("MP_TRADING_BLOCKED",v)&&v>0) return true; if(GlobalVariableGet("MP_NEWS_BLOCKED",v)&&v>0) return true; return false; }
+bool IsWithinTradingHours() { MqlDateTime dt; TimeToStruct(GetLocalTime(),dt); return(dt.hour>=InpStartHour&&dt.hour<InpEndHour); }
+int CountMyPositions() { int c=0; for(int i=0;i<PositionsTotal();i++){ulong t=PositionGetTicket(i); if(t>0&&PositionGetInteger(POSITION_MAGIC)==InpMagicNumber&&PositionGetString(POSITION_SYMBOL)==_Symbol) c++;} return c; }
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  CORE FUNCTIONS
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+int OnInit()
+{
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  MACD MOMENTUM STRATEGY 1.0 — Michele Piazzoli");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   g_handleMACD  = iMACD(_Symbol, InpTimeframe, InpMACDFast, InpMACDSlow, InpMACDSignal, PRICE_CLOSE);
+   g_handleTrend = iMA(_Symbol, InpTimeframe, InpEmaTrend, 0, MODE_EMA, PRICE_CLOSE);
+
+   if(g_handleMACD==INVALID_HANDLE||g_handleTrend==INVALID_HANDLE){ Print("[WARNING] Failed to create handles"); return INIT_SUCCEEDED; }
+
+   Print("[INIT] Symbol: ",_Symbol," | TF: ",EnumToString(InpTimeframe)," | MACD(",InpMACDFast,",",InpMACDSlow,",",InpMACDSignal,") | Magic: ",InpMagicNumber);
+   CreateDashboard(); UpdateDashboard(); EventSetTimer(60);
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason) { if(g_handleMACD!=INVALID_HANDLE)IndicatorRelease(g_handleMACD); if(g_handleTrend!=INVALID_HANDLE)IndicatorRelease(g_handleTrend); EventKillTimer(); DeleteDashboard(); }
+void OnTick() { ManageTrailingStop(); CheckSignal(); UpdateDashboard(); }
+void OnTimer() { UpdateDashboard(); }
+
+void CheckSignal()
+{
+   if(IsTradingBlocked()||!IsWithinTradingHours()||CountMyPositions()>0) return;
+
+   // MACD: buffer 0=main, buffer 1=signal
+   double macd[3], signal[3], trend[3];
+   if(CopyBuffer(g_handleMACD,0,0,3,macd)<3) return;
+   if(CopyBuffer(g_handleMACD,1,0,3,signal)<3) return;
+   if(CopyBuffer(g_handleTrend,0,0,3,trend)<3) return;
+   ArraySetAsSeries(macd,true); ArraySetAsSeries(signal,true); ArraySetAsSeries(trend,true);
+
+   // Crossover on completed bars
+   bool bullishCross = macd[1]>signal[1] && macd[2]<=signal[2];
+   bool bearishCross = macd[1]<signal[1] && macd[2]>=signal[2];
+
+   // Histogram momentum: histogram growing in signal direction
+   double hist1 = macd[1]-signal[1];
+   bool histPositive = hist1 > 0;
+   bool histNegative = hist1 < 0;
+
+   double close = iClose(_Symbol,InpTimeframe,1);
+   bool trendUp   = !InpUseTrendFilter || close > trend[1];
+   bool trendDown = !InpUseTrendFilter || close < trend[1];
+
+   if(bullishCross && histPositive && trendUp)
+   {
+      g_lastSignal = "BUY — MACD Cross Up";
+      OpenTrade(ORDER_TYPE_BUY);
+   }
+   else if(bearishCross && histNegative && trendDown)
+   {
+      g_lastSignal = "SELL — MACD Cross Down";
+      OpenTrade(ORDER_TYPE_SELL);
+   }
+}
+
+void OpenTrade(ENUM_ORDER_TYPE type)
+{
+   double price=(type==ORDER_TYPE_BUY)?SymbolInfoDouble(_Symbol,SYMBOL_ASK):SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double point=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+   double sl=(type==ORDER_TYPE_BUY)?price-InpStopLoss*point:price+InpStopLoss*point;
+   double tp=(type==ORDER_TYPE_BUY)?price+InpTakeProfit*point:price-InpTakeProfit*point;
+   MqlTradeRequest req;MqlTradeResult res;ZeroMemory(req);ZeroMemory(res);
+   req.action=TRADE_ACTION_DEAL;req.symbol=_Symbol;req.volume=InpLotSize;req.type=type;
+   req.price=price;req.sl=sl;req.tp=tp;req.deviation=InpSlippage;req.magic=InpMagicNumber;req.comment="";req.type_filling=ORDER_FILLING_FOK;
+   if(OrderSend(req,res)&&res.retcode==TRADE_RETCODE_DONE){g_totalTrades++;MqlDateTime dt;TimeToStruct(GetLocalTime(),dt);g_lastTradeTime=StringFormat("%02d:%02d:%02d",dt.hour,dt.min,dt.sec);Print("[TRADE] ",(type==ORDER_TYPE_BUY?"BUY":"SELL")," @ ",DoubleToString(price,_Digits));}
+   else Print("[WARNING] Order failed | Retcode: ",res.retcode);
+}
+
+void ManageTrailingStop()
+{
+   if(InpTrailingStop<=0) return;
+   double point=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+   for(int i=0;i<PositionsTotal();i++){ulong ticket=PositionGetTicket(i);if(ticket==0)continue;if(PositionGetInteger(POSITION_MAGIC)!=InpMagicNumber||PositionGetString(POSITION_SYMBOL)!=_Symbol)continue;
+   ENUM_POSITION_TYPE type=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);double curSL=PositionGetDouble(POSITION_SL),op=PositionGetDouble(POSITION_PRICE_OPEN);
+   if(type==POSITION_TYPE_BUY){double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID),nsl=bid-InpTrailingStop*point;if(nsl>curSL&&nsl>op){MqlTradeRequest r;MqlTradeResult s;ZeroMemory(r);ZeroMemory(s);r.action=TRADE_ACTION_SLTP;r.position=ticket;r.symbol=_Symbol;r.sl=nsl;r.tp=PositionGetDouble(POSITION_TP);OrderSend(r,s);}}
+   else{double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK),nsl=ask+InpTrailingStop*point;if((nsl<curSL||curSL==0)&&nsl<op){MqlTradeRequest r;MqlTradeResult s;ZeroMemory(r);ZeroMemory(s);r.action=TRADE_ACTION_SLTP;r.position=ticket;r.symbol=_Symbol;r.sl=nsl;r.tp=PositionGetDouble(POSITION_TP);OrderSend(r,s);}}}
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  DASHBOARD
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CreateDashboard()
+{
+   int x=InpDashboardX,y=InpDashboardY,w=InpDashboardWidth,h=InpDashboardHeight,sp=InpDashRowSpacing;
+   if(ObjectFind(0,"MP_BG")>=0)ObjectDelete(0,"MP_BG");ObjectCreate(0,"MP_BG",OBJ_RECTANGLE_LABEL,0,0,0);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_XDISTANCE,x);ObjectSetInteger(0,"MP_BG",OBJPROP_YDISTANCE,y);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_XSIZE,w);ObjectSetInteger(0,"MP_BG",OBJPROP_YSIZE,h);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_BGCOLOR,InpDashBgColor);ObjectSetInteger(0,"MP_BG",OBJPROP_BORDER_TYPE,BORDER_FLAT);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_COLOR,InpDashBorderColor);ObjectSetInteger(0,"MP_BG",OBJPROP_WIDTH,2);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_BACK,false);ObjectSetInteger(0,"MP_BG",OBJPROP_SELECTABLE,false);
+
+   int tY=y+20;CreateLabel("MP_TITLE","MACD MOMENTUM — MICHELE PIAZZOLI",x+20,tY,InpDashTitleColor,InpDashTitleSize,InpDashFont+" Bold");
+   int sY=tY+InpDashTitleSize+15;if(ObjectFind(0,"MP_SEP1")>=0)ObjectDelete(0,"MP_SEP1");ObjectCreate(0,"MP_SEP1",OBJ_RECTANGLE_LABEL,0,0,0);
+   ObjectSetInteger(0,"MP_SEP1",OBJPROP_XDISTANCE,x+15);ObjectSetInteger(0,"MP_SEP1",OBJPROP_YDISTANCE,sY);ObjectSetInteger(0,"MP_SEP1",OBJPROP_XSIZE,w-30);ObjectSetInteger(0,"MP_SEP1",OBJPROP_YSIZE,1);
+   ObjectSetInteger(0,"MP_SEP1",OBJPROP_BGCOLOR,InpDashBorderColor);ObjectSetInteger(0,"MP_SEP1",OBJPROP_BORDER_TYPE,BORDER_FLAT);ObjectSetInteger(0,"MP_SEP1",OBJPROP_COLOR,InpDashBorderColor);
+   ObjectSetInteger(0,"MP_SEP1",OBJPROP_BACK,false);ObjectSetInteger(0,"MP_SEP1",OBJPROP_SELECTABLE,false);
+
+   int r1=sY+20,r2=r1+sp,r3=r2+sp,r4=r3+sp,r5=r4+sp,r6=r5+sp,r7=r6+sp,vx=x+250;
+   CreateLabel("MP_LBL_STATUS","Status:",x+20,r1,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_STATUS","● READY",vx,r1,clrLime,InpDashLabelSize+4,InpDashFont+" Bold");
+   CreateLabel("MP_LBL_SIGNAL","Last Signal:",x+20,r2,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_SIGNAL","—",vx,r2,InpDashValueColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_LBL_POS","Open Positions:",x+20,r3,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_POS","0",vx,r3,InpDashValueColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_LBL_TRADES","Trades Today:",x+20,r4,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_TRADES","0",vx,r4,InpDashValueColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_LBL_LAST","Last Trade:",x+20,r5,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_LAST","—",vx,r5,InpDashValueColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_LBL_MACD","MACD / Signal:",x+20,r6,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_MACD","— / —",vx,r6,InpDashValueColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_LBL_HIST","Histogram:",x+20,r7,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_HIST","—",vx,r7,InpDashValueColor,InpDashLabelSize,InpDashFont+" Bold");
+}
+
+void UpdateDashboard()
+{
+   if(IsTradingBlocked()){ObjectSetString(0,"MP_VAL_STATUS",OBJPROP_TEXT,"● BLOCKED");ObjectSetInteger(0,"MP_VAL_STATUS",OBJPROP_COLOR,clrRed);}
+   else if(!IsWithinTradingHours()){ObjectSetString(0,"MP_VAL_STATUS",OBJPROP_TEXT,"● OFF HOURS");ObjectSetInteger(0,"MP_VAL_STATUS",OBJPROP_COLOR,clrOrange);}
+   else{ObjectSetString(0,"MP_VAL_STATUS",OBJPROP_TEXT,"● READY");ObjectSetInteger(0,"MP_VAL_STATUS",OBJPROP_COLOR,clrLime);}
+   ObjectSetString(0,"MP_VAL_SIGNAL",OBJPROP_TEXT,g_lastSignal);
+   ObjectSetString(0,"MP_VAL_POS",OBJPROP_TEXT,IntegerToString(CountMyPositions()));
+   ObjectSetString(0,"MP_VAL_TRADES",OBJPROP_TEXT,IntegerToString(g_totalTrades));
+   ObjectSetString(0,"MP_VAL_LAST",OBJPROP_TEXT,g_lastTradeTime);
+
+   double m[1],s[1]; if(CopyBuffer(g_handleMACD,0,1,1,m)==1&&CopyBuffer(g_handleMACD,1,1,1,s)==1)
+   {ObjectSetString(0,"MP_VAL_MACD",OBJPROP_TEXT,DoubleToString(m[0],6)+" / "+DoubleToString(s[0],6));
+    double hist=m[0]-s[0]; ObjectSetString(0,"MP_VAL_HIST",OBJPROP_TEXT,DoubleToString(hist,6));
+    ObjectSetInteger(0,"MP_VAL_HIST",OBJPROP_COLOR,hist>=0?clrLime:clrRed);}
+   ChartRedraw(0);
+}
+
+void DeleteDashboard(){string obj[]={"MP_BG","MP_TITLE","MP_SEP1","MP_LBL_STATUS","MP_VAL_STATUS","MP_LBL_SIGNAL","MP_VAL_SIGNAL","MP_LBL_POS","MP_VAL_POS","MP_LBL_TRADES","MP_VAL_TRADES","MP_LBL_LAST","MP_VAL_LAST","MP_LBL_MACD","MP_VAL_MACD","MP_LBL_HIST","MP_VAL_HIST"};for(int i=0;i<ArraySize(obj);i++)ObjectDelete(0,obj[i]);}
+
+void CreateLabel(string name,string text,int x,int y,color clr,int size,string font)
+{if(ObjectFind(0,name)>=0)ObjectDelete(0,name);ObjectCreate(0,name,OBJ_LABEL,0,0,0);ObjectSetInteger(0,name,OBJPROP_XDISTANCE,x);ObjectSetInteger(0,name,OBJPROP_YDISTANCE,y);ObjectSetInteger(0,name,OBJPROP_COLOR,clr);ObjectSetInteger(0,name,OBJPROP_FONTSIZE,size);ObjectSetString(0,name,OBJPROP_FONT,font);ObjectSetString(0,name,OBJPROP_TEXT,text);ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);ObjectSetInteger(0,name,OBJPROP_ANCHOR,ANCHOR_LEFT_UPPER);ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);ObjectSetInteger(0,name,OBJPROP_BACK,false);}
