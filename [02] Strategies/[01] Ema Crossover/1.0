@@ -1,0 +1,388 @@
+#property strict
+#property copyright "Michele Piazzoli"
+#property version   "1.0"
+#property description "EMA Crossover Strategy - Trades EMA 9/21 crossovers"
+#property description "Trend filter with EMA 200 — only buys above, only sells below"
+#property description "Includes SL, TP, trailing stop and global variable block check"
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  INPUT PARAMETERS
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// ── Timezone ──
+input int         InpTimezoneOffset       = -1;              // Timezone Offset (hours from broker time)
+
+// ── Strategy ──
+input int         InpEmaFast              = 9;               // Fast EMA Period
+input int         InpEmaSlow              = 21;              // Slow EMA Period
+input int         InpEmaTrend             = 200;             // Trend EMA Period
+input bool        InpUseTrendFilter       = true;            // Use EMA 200 Trend Filter
+input ENUM_TIMEFRAMES InpTimeframe        = PERIOD_H1;       // Strategy Timeframe
+
+// ── Risk Management ──
+input double      InpLotSize              = 0.01;            // Lot Size
+input int         InpStopLoss             = 300;             // Stop Loss (points)
+input int         InpTakeProfit           = 600;             // Take Profit (points)
+input int         InpTrailingStop         = 150;             // Trailing Stop (points, 0 = disabled)
+input int         InpSlippage             = 10;              // Max Slippage (points)
+input int         InpMagicNumber          = 1001;            // Magic Number
+
+// ── Trading Hours ──
+input int         InpStartHour            = 8;               // Trading Start Hour (local time)
+input int         InpEndHour              = 20;              // Trading End Hour (local time)
+
+// ── Dashboard Position ──
+input int         InpDashboardX           = 20;              // Dashboard X Position
+input int         InpDashboardY           = 50;              // Dashboard Y Position
+input int         InpDashboardWidth       = 700;             // Dashboard Width
+input int         InpDashboardHeight      = 300;             // Dashboard Height
+
+// ── Dashboard Style ──
+input color       InpDashBgColor          = clrBlack;        // Dashboard Background Color
+input color       InpDashBorderColor      = clrDarkGray;     // Dashboard Border Color
+input color       InpDashTitleColor       = clrWhite;        // Title Text Color
+input color       InpDashLabelColor       = clrSilver;       // Label Text Color
+input color       InpDashValueColor       = clrAqua;         // Value Text Color
+input string      InpDashFont             = "Arial";         // Dashboard Font
+input int         InpDashTitleSize        = 18;              // Title Font Size
+input int         InpDashLabelSize        = 14;              // Label Font Size
+input int         InpDashRowSpacing       = 20;              // Vertical Spacing Between Rows
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  GLOBAL VARIABLES
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+int      g_handleFast    = INVALID_HANDLE;
+int      g_handleSlow    = INVALID_HANDLE;
+int      g_handleTrend   = INVALID_HANDLE;
+int      g_totalTrades   = 0;
+int      g_wins          = 0;
+int      g_losses        = 0;
+string   g_lastSignal    = "—";
+string   g_lastTradeTime = "—";
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  HELPER FUNCTIONS
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+datetime GetLocalTime()
+{
+   return TimeCurrent() + (InpTimezoneOffset * 3600);
+}
+
+bool IsTradingBlocked()
+{
+   double blocked = 0;
+   if(GlobalVariableGet("MP_TRADING_BLOCKED", blocked))
+      if(blocked > 0) return true;
+   if(GlobalVariableGet("MP_NEWS_BLOCKED", blocked))
+      if(blocked > 0) return true;
+   return false;
+}
+
+bool IsWithinTradingHours()
+{
+   MqlDateTime dt;
+   TimeToStruct(GetLocalTime(), dt);
+   return (dt.hour >= InpStartHour && dt.hour < InpEndHour);
+}
+
+int CountMyPositions()
+{
+   int count = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber && PositionGetString(POSITION_SYMBOL) == _Symbol)
+         count++;
+   }
+   return count;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  CORE FUNCTIONS
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+int OnInit()
+{
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  EMA CROSSOVER STRATEGY 1.0 — Michele Piazzoli");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   g_handleFast  = iMA(_Symbol, InpTimeframe, InpEmaFast,  0, MODE_EMA, PRICE_CLOSE);
+   g_handleSlow  = iMA(_Symbol, InpTimeframe, InpEmaSlow,  0, MODE_EMA, PRICE_CLOSE);
+   g_handleTrend = iMA(_Symbol, InpTimeframe, InpEmaTrend, 0, MODE_EMA, PRICE_CLOSE);
+
+   if(g_handleFast == INVALID_HANDLE || g_handleSlow == INVALID_HANDLE || g_handleTrend == INVALID_HANDLE)
+   {
+      Print("[WARNING] Failed to create indicator handles");
+      return INIT_SUCCEEDED;
+   }
+
+   Print("[INIT] Symbol:     ", _Symbol);
+   Print("[INIT] Timeframe:  ", EnumToString(InpTimeframe));
+   Print("[INIT] EMA Fast:   ", InpEmaFast);
+   Print("[INIT] EMA Slow:   ", InpEmaSlow);
+   Print("[INIT] EMA Trend:  ", InpEmaTrend);
+   Print("[INIT] Magic:      ", InpMagicNumber);
+
+   CreateDashboard();
+   UpdateDashboard();
+
+   EventSetTimer(60);
+
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   if(g_handleFast  != INVALID_HANDLE) IndicatorRelease(g_handleFast);
+   if(g_handleSlow  != INVALID_HANDLE) IndicatorRelease(g_handleSlow);
+   if(g_handleTrend != INVALID_HANDLE) IndicatorRelease(g_handleTrend);
+   EventKillTimer();
+   DeleteDashboard();
+}
+
+void OnTick()
+{
+   ManageTrailingStop();
+   CheckSignal();
+   UpdateDashboard();
+}
+
+void OnTimer()
+{
+   UpdateDashboard();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  SIGNAL LOGIC
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CheckSignal()
+{
+   if(IsTradingBlocked() || !IsWithinTradingHours() || CountMyPositions() > 0)
+      return;
+
+   // Need bars [1] and [2] for crossover detection (completed bars only)
+   double fast[3], slow[3], trend[3];
+   if(CopyBuffer(g_handleFast,  0, 0, 3, fast)  < 3) return;
+   if(CopyBuffer(g_handleSlow,  0, 0, 3, slow)  < 3) return;
+   if(CopyBuffer(g_handleTrend, 0, 0, 3, trend) < 3) return;
+
+   // ArraySetAsSeries to index [0]=current, [1]=previous, [2]=before that
+   ArraySetAsSeries(fast, true);
+   ArraySetAsSeries(slow, true);
+   ArraySetAsSeries(trend, true);
+
+   // Crossover on completed bars [1] and [2]
+   bool bullishCross = fast[1] > slow[1] && fast[2] <= slow[2];
+   bool bearishCross = fast[1] < slow[1] && fast[2] >= slow[2];
+
+   double close = iClose(_Symbol, InpTimeframe, 1);
+
+   // Trend filter
+   bool trendUp   = !InpUseTrendFilter || close > trend[1];
+   bool trendDown = !InpUseTrendFilter || close < trend[1];
+
+   if(bullishCross && trendUp)
+   {
+      g_lastSignal = "BUY CROSS";
+      OpenTrade(ORDER_TYPE_BUY);
+   }
+   else if(bearishCross && trendDown)
+   {
+      g_lastSignal = "SELL CROSS";
+      OpenTrade(ORDER_TYPE_SELL);
+   }
+}
+
+void OpenTrade(ENUM_ORDER_TYPE type)
+{
+   double price = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   double sl = (type == ORDER_TYPE_BUY) ? price - InpStopLoss * point : price + InpStopLoss * point;
+   double tp = (type == ORDER_TYPE_BUY) ? price + InpTakeProfit * point : price - InpTakeProfit * point;
+
+   MqlTradeRequest request;
+   MqlTradeResult  result;
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   request.action       = TRADE_ACTION_DEAL;
+   request.symbol       = _Symbol;
+   request.volume       = InpLotSize;
+   request.type         = type;
+   request.price        = price;
+   request.sl           = sl;
+   request.tp           = tp;
+   request.deviation    = InpSlippage;
+   request.magic        = InpMagicNumber;
+   request.comment      = "";
+   request.type_filling = ORDER_FILLING_FOK;
+
+   if(OrderSend(request, result) && result.retcode == TRADE_RETCODE_DONE)
+   {
+      g_totalTrades++;
+      MqlDateTime dt;
+      TimeToStruct(GetLocalTime(), dt);
+      g_lastTradeTime = StringFormat("%02d:%02d:%02d", dt.hour, dt.min, dt.sec);
+      Print("[TRADE] ", (type == ORDER_TYPE_BUY ? "BUY" : "SELL"), " @ ", DoubleToString(price, _Digits), " | SL: ", DoubleToString(sl, _Digits), " | TP: ", DoubleToString(tp, _Digits));
+   }
+   else
+   {
+      Print("[WARNING] Order failed | Retcode: ", result.retcode);
+   }
+}
+
+void ManageTrailingStop()
+{
+   if(InpTrailingStop <= 0) return;
+
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double newSL = bid - InpTrailingStop * point;
+         if(newSL > currentSL && newSL > openPrice)
+         {
+            MqlTradeRequest req; MqlTradeResult res;
+            ZeroMemory(req); ZeroMemory(res);
+            req.action   = TRADE_ACTION_SLTP;
+            req.position = ticket;
+            req.symbol   = _Symbol;
+            req.sl       = newSL;
+            req.tp       = PositionGetDouble(POSITION_TP);
+            OrderSend(req, res);
+         }
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double newSL = ask + InpTrailingStop * point;
+         if(newSL < currentSL || currentSL == 0)
+         {
+            if(newSL < openPrice)
+            {
+               MqlTradeRequest req; MqlTradeResult res;
+               ZeroMemory(req); ZeroMemory(res);
+               req.action   = TRADE_ACTION_SLTP;
+               req.position = ticket;
+               req.symbol   = _Symbol;
+               req.sl       = newSL;
+               req.tp       = PositionGetDouble(POSITION_TP);
+               OrderSend(req, res);
+            }
+         }
+      }
+   }
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  DASHBOARD
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CreateDashboard()
+{
+   int x = InpDashboardX, y = InpDashboardY, w = InpDashboardWidth, h = InpDashboardHeight, sp = InpDashRowSpacing;
+
+   if(ObjectFind(0,"MP_BG")>=0) ObjectDelete(0,"MP_BG");
+   ObjectCreate(0,"MP_BG",OBJ_RECTANGLE_LABEL,0,0,0);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_XDISTANCE,x); ObjectSetInteger(0,"MP_BG",OBJPROP_YDISTANCE,y);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_XSIZE,w); ObjectSetInteger(0,"MP_BG",OBJPROP_YSIZE,h);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_BGCOLOR,InpDashBgColor); ObjectSetInteger(0,"MP_BG",OBJPROP_BORDER_TYPE,BORDER_FLAT);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_COLOR,InpDashBorderColor); ObjectSetInteger(0,"MP_BG",OBJPROP_WIDTH,2);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_BACK,false); ObjectSetInteger(0,"MP_BG",OBJPROP_SELECTABLE,false);
+
+   int titleY = y + 20;
+   CreateLabel("MP_TITLE","EMA CROSSOVER — MICHELE PIAZZOLI",x+20,titleY,InpDashTitleColor,InpDashTitleSize,InpDashFont+" Bold");
+
+   int sepY = titleY + InpDashTitleSize + 15;
+   if(ObjectFind(0,"MP_SEP1")>=0) ObjectDelete(0,"MP_SEP1");
+   ObjectCreate(0,"MP_SEP1",OBJ_RECTANGLE_LABEL,0,0,0);
+   ObjectSetInteger(0,"MP_SEP1",OBJPROP_XDISTANCE,x+15); ObjectSetInteger(0,"MP_SEP1",OBJPROP_YDISTANCE,sepY);
+   ObjectSetInteger(0,"MP_SEP1",OBJPROP_XSIZE,w-30); ObjectSetInteger(0,"MP_SEP1",OBJPROP_YSIZE,1);
+   ObjectSetInteger(0,"MP_SEP1",OBJPROP_BGCOLOR,InpDashBorderColor); ObjectSetInteger(0,"MP_SEP1",OBJPROP_BORDER_TYPE,BORDER_FLAT);
+   ObjectSetInteger(0,"MP_SEP1",OBJPROP_COLOR,InpDashBorderColor);
+   ObjectSetInteger(0,"MP_SEP1",OBJPROP_BACK,false); ObjectSetInteger(0,"MP_SEP1",OBJPROP_SELECTABLE,false);
+
+   int r1=sepY+20, r2=r1+sp, r3=r2+sp, r4=r3+sp, r5=r4+sp, r6=r5+sp, r7=r6+sp, vx=x+250;
+
+   CreateLabel("MP_LBL_STATUS","Status:",x+20,r1,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_STATUS","● READY",vx,r1,clrLime,InpDashLabelSize+4,InpDashFont+" Bold");
+   CreateLabel("MP_LBL_SIGNAL","Last Signal:",x+20,r2,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_SIGNAL","—",vx,r2,InpDashValueColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_LBL_POS","Open Positions:",x+20,r3,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_POS","0",vx,r3,InpDashValueColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_LBL_TRADES","Trades Today:",x+20,r4,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_TRADES","0",vx,r4,InpDashValueColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_LBL_LAST","Last Trade:",x+20,r5,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_LAST","—",vx,r5,InpDashValueColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_LBL_EMA","EMA Fast / Slow:",x+20,r6,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_EMA","— / —",vx,r6,InpDashValueColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_LBL_TREND","Trend (EMA 200):",x+20,r7,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+   CreateLabel("MP_VAL_TREND","—",vx,r7,InpDashValueColor,InpDashLabelSize,InpDashFont+" Bold");
+}
+
+void UpdateDashboard()
+{
+   // Status
+   if(IsTradingBlocked())
+   { ObjectSetString(0,"MP_VAL_STATUS",OBJPROP_TEXT,"● BLOCKED"); ObjectSetInteger(0,"MP_VAL_STATUS",OBJPROP_COLOR,clrRed); }
+   else if(!IsWithinTradingHours())
+   { ObjectSetString(0,"MP_VAL_STATUS",OBJPROP_TEXT,"● OFF HOURS"); ObjectSetInteger(0,"MP_VAL_STATUS",OBJPROP_COLOR,clrOrange); }
+   else
+   { ObjectSetString(0,"MP_VAL_STATUS",OBJPROP_TEXT,"● READY"); ObjectSetInteger(0,"MP_VAL_STATUS",OBJPROP_COLOR,clrLime); }
+
+   ObjectSetString(0,"MP_VAL_SIGNAL",OBJPROP_TEXT,g_lastSignal);
+   ObjectSetString(0,"MP_VAL_POS",OBJPROP_TEXT,IntegerToString(CountMyPositions()));
+   ObjectSetString(0,"MP_VAL_TRADES",OBJPROP_TEXT,IntegerToString(g_totalTrades));
+   ObjectSetString(0,"MP_VAL_LAST",OBJPROP_TEXT,g_lastTradeTime);
+
+   double fast[1], slow[1], trend[1];
+   if(CopyBuffer(g_handleFast,0,1,1,fast)==1 && CopyBuffer(g_handleSlow,0,1,1,slow)==1)
+      ObjectSetString(0,"MP_VAL_EMA",OBJPROP_TEXT,DoubleToString(fast[0],_Digits)+" / "+DoubleToString(slow[0],_Digits));
+
+   if(CopyBuffer(g_handleTrend,0,1,1,trend)==1)
+   {
+      double close = iClose(_Symbol,InpTimeframe,1);
+      string dir = close > trend[0] ? "BULLISH" : "BEARISH";
+      color  clr = close > trend[0] ? clrLime : clrRed;
+      ObjectSetString(0,"MP_VAL_TREND",OBJPROP_TEXT,dir+" ("+DoubleToString(trend[0],_Digits)+")");
+      ObjectSetInteger(0,"MP_VAL_TREND",OBJPROP_COLOR,clr);
+   }
+
+   ChartRedraw(0);
+}
+
+void DeleteDashboard()
+{
+   string obj[]={"MP_BG","MP_TITLE","MP_SEP1","MP_LBL_STATUS","MP_VAL_STATUS","MP_LBL_SIGNAL","MP_VAL_SIGNAL",
+      "MP_LBL_POS","MP_VAL_POS","MP_LBL_TRADES","MP_VAL_TRADES","MP_LBL_LAST","MP_VAL_LAST",
+      "MP_LBL_EMA","MP_VAL_EMA","MP_LBL_TREND","MP_VAL_TREND"};
+   for(int i=0;i<ArraySize(obj);i++) ObjectDelete(0,obj[i]);
+}
+
+void CreateLabel(string name,string text,int x,int y,color clr,int size,string font)
+{
+   if(ObjectFind(0,name)>=0) ObjectDelete(0,name);
+   ObjectCreate(0,name,OBJ_LABEL,0,0,0);
+   ObjectSetInteger(0,name,OBJPROP_XDISTANCE,x); ObjectSetInteger(0,name,OBJPROP_YDISTANCE,y);
+   ObjectSetInteger(0,name,OBJPROP_COLOR,clr); ObjectSetInteger(0,name,OBJPROP_FONTSIZE,size);
+   ObjectSetString(0,name,OBJPROP_FONT,font); ObjectSetString(0,name,OBJPROP_TEXT,text);
+   ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER); ObjectSetInteger(0,name,OBJPROP_ANCHOR,ANCHOR_LEFT_UPPER);
+   ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false); ObjectSetInteger(0,name,OBJPROP_BACK,false);
+}
