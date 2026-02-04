@@ -1,1 +1,482 @@
+#property strict
+#property copyright "Michele Piazzoli"
+#property version   "1.0"
+#property description "Trade Exporter CSV EA - Exports closed trades to CSV"
+#property description "Creates YYYY/MM/DD folder structure in sandbox"
+#property description "Each closed trade is appended with full trade history columns"
 
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  INPUT PARAMETERS
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// ── Timezone ──
+input int         InpTimezoneOffset       = -1;              // Timezone Offset (hours from broker time)
+
+// ── CSV Settings ──
+input string      InpCSVBasePath          = "TradeExport";   // Base Folder Name in Sandbox
+
+// ── Dashboard Position ──
+input int         InpDashboardX           = 20;              // Dashboard X Position
+input int         InpDashboardY           = 50;              // Dashboard Y Position
+input int         InpDashboardWidth       = 700;             // Dashboard Width
+input int         InpDashboardHeight      = 300;             // Dashboard Height
+
+// ── Dashboard Style ──
+input color       InpDashBgColor          = clrBlack;        // Dashboard Background Color
+input color       InpDashBorderColor      = clrDarkGray;     // Dashboard Border Color
+input color       InpDashTitleColor       = clrWhite;        // Title Text Color
+input color       InpDashLabelColor       = clrSilver;       // Label Text Color
+input color       InpDashValueColor       = clrAqua;         // Value Text Color
+input string      InpDashFont             = "Arial";         // Dashboard Font
+input int         InpDashTitleSize        = 18;              // Title Font Size
+input int         InpDashLabelSize        = 14;              // Label Font Size
+input int         InpDashRowSpacing       = 30;              // Vertical Spacing Between Rows
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  GLOBAL VARIABLES
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+int      g_lastDealsTotal    = 0;            // Last known total deals count to detect new closes
+int      g_exportedToday     = 0;            // Number of trades exported today
+string   g_csvFilePath       = "";           // Current CSV file path
+string   g_csvStatus         = "NOT CREATED";  // CSV creation status for dashboard
+string   g_lastExportTime    = "—";          // Last export timestamp for dashboard
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 1/10 — GetLocalTime
+//  Applies timezone offset to broker time and returns adjusted local datetime
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+datetime GetLocalTime()
+{
+   return TimeCurrent() + (InpTimezoneOffset * 3600);
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 2/10 — OnInit
+//  Initialization: loads deal history, builds CSV path, creates dashboard
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+int OnInit()
+{
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  TRADE EXPORTER CSV EA 1.0 — Michele Piazzoli");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   // Load full deal history
+   HistorySelect(0, TimeCurrent());
+   g_lastDealsTotal = HistoryDealsTotal();
+   g_exportedToday  = 0;
+
+   // Build today's CSV path
+   BuildCSVPath();
+
+   Print("[INIT] Account:        ", AccountInfoInteger(ACCOUNT_LOGIN));
+   Print("[INIT] Existing Deals: ", g_lastDealsTotal);
+   Print("[INIT] CSV Path:       ", g_csvFilePath);
+
+   CreateDashboard();
+   UpdateDashboard();
+
+   EventSetTimer(60);
+
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  EA READY — Trade export monitoring active");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   return INIT_SUCCEEDED;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 3/10 — OnDeinit
+//  Shutdown: removes dashboard objects and kills timer
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void OnDeinit(const int reason)
+{
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  TRADE EXPORTER CSV EA 1.0 — SHUTDOWN");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   EventKillTimer();
+   DeleteDashboard();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 4/10 — OnTick
+//  Main loop: checks for new closed deals and exports them
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void OnTick()
+{
+   CheckDayChange();
+   CheckNewDeals();
+   UpdateDashboard();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 5/10 — OnTimer
+//  Timer callback every 60 seconds: checks for new deals even without ticks
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void OnTimer()
+{
+   CheckDayChange();
+   CheckNewDeals();
+   UpdateDashboard();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 6/10 — CheckDayChange
+//  Detects midnight rollover: rebuilds CSV path for new day, resets daily counter
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CheckDayChange()
+{
+   static int lastDay = 0;
+
+   MqlDateTime dt;
+   TimeToStruct(GetLocalTime(), dt);
+
+   if(lastDay != dt.day)
+   {
+      lastDay = dt.day;
+      g_exportedToday = 0;
+      g_csvStatus     = "NOT CREATED";
+      g_lastExportTime = "—";
+      BuildCSVPath();
+      Print("[EXPORTER] New day — CSV path: ", g_csvFilePath);
+   }
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 7/10 — BuildCSVPath
+//  Builds the CSV file path with YYYY/MM/DD folder structure in sandbox
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void BuildCSVPath()
+{
+   MqlDateTime dt;
+   TimeToStruct(GetLocalTime(), dt);
+
+   string yearStr  = IntegerToString(dt.year);
+   string monthStr = StringFormat("%02d", dt.mon);
+   string dayStr   = StringFormat("%02d", dt.day);
+
+   // Create folder structure: TradeExport/YYYY/MM/DD/
+   string folderYear  = InpCSVBasePath + "\\" + yearStr;
+   string folderMonth = folderYear + "\\" + monthStr;
+   string folderDay   = folderMonth + "\\" + dayStr;
+
+   // MQL5 creates folders automatically when writing files
+   // File path: TradeExport/YYYY/MM/DD/trades.csv
+   g_csvFilePath = folderDay + "\\trades.csv";
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 8/10 — CheckNewDeals
+//  Detects newly closed deals by comparing deal count, exports new ones to CSV
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CheckNewDeals()
+{
+   HistorySelect(0, TimeCurrent());
+   int currentDeals = HistoryDealsTotal();
+
+   if(currentDeals <= g_lastDealsTotal)
+      return;
+
+   // Process new deals
+   for(int i = g_lastDealsTotal; i < currentDeals; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      // Only export actual trade closes (DEAL_ENTRY_OUT or DEAL_ENTRY_INOUT)
+      ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(ticket, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT)
+         continue;
+
+      // Skip non-trade deals (balance, credit, commission, etc.)
+      ENUM_DEAL_TYPE dtype = (ENUM_DEAL_TYPE)HistoryDealGetInteger(ticket, DEAL_TYPE);
+      if(dtype != DEAL_TYPE_BUY && dtype != DEAL_TYPE_SELL)
+         continue;
+
+      // Skip deals without a symbol (not actual trades)
+      string sym = HistoryDealGetString(ticket, DEAL_SYMBOL);
+      if(sym == "")
+         continue;
+
+      ExportDealToCSV(ticket);
+      g_exportedToday++;
+   }
+
+   g_lastDealsTotal = currentDeals;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 9/10 — ExportDealToCSV
+//  Writes a single closed deal to the CSV file with all trade history columns
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void ExportDealToCSV(ulong ticket)
+{
+   // Check if file exists to decide whether to write header
+   bool fileExists = FileIsExist(g_csvFilePath);
+
+   int handle = FileOpen(g_csvFilePath, FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE)
+   {
+      Print("[WARNING] Cannot open CSV: ", g_csvFilePath, " | Error: ", GetLastError());
+      g_csvStatus = "WRITE ERROR";
+      return;
+   }
+
+   // Move to end of file
+   FileSeek(handle, 0, SEEK_END);
+
+   // Write header if new file
+   if(!fileExists || FileSize(handle) == 0)
+   {
+      FileWrite(handle,
+         "Time",
+         "Hour",
+         "Symbol",
+         "Ticket",
+         "Type",
+         "Volume",
+         "Price",
+         "S/L",
+         "T/P",
+         "Time Close",
+         "Hour Close",
+         "Price Close",
+         "Profit",
+         "Comment"
+      );
+   }
+
+   // Extract deal data
+   datetime openTime  = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+   string   symbol    = HistoryDealGetString(ticket, DEAL_SYMBOL);
+   long     dealType  = HistoryDealGetInteger(ticket, DEAL_TYPE);
+   double   volume    = HistoryDealGetDouble(ticket, DEAL_VOLUME);
+   double   price     = HistoryDealGetDouble(ticket, DEAL_PRICE);
+   double   profit    = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+   string   comment   = HistoryDealGetString(ticket, DEAL_COMMENT);
+   long     posID     = HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
+
+   // Get the type string
+   string typeStr = "unknown";
+   if(dealType == DEAL_TYPE_BUY)       typeStr = "buy";
+   else if(dealType == DEAL_TYPE_SELL) typeStr = "sell";
+
+   // Try to find the opening deal for SL/TP and open price/time
+   double   openPrice    = price;
+   double   sl           = 0;
+   double   tp           = 0;
+   datetime closeTime    = openTime;
+   double   closePrice   = price;
+   string   openDateStr  = TimeToString(openTime, TIME_DATE);
+   string   openHourStr  = TimeToString(openTime, TIME_SECONDS);
+
+   // Search position history for SL/TP
+   if(HistorySelectByPosition(posID))
+   {
+      int totalPosDeals = HistoryDealsTotal();
+
+      for(int j = 0; j < totalPosDeals; j++)
+      {
+         ulong posTicket = HistoryDealGetTicket(j);
+         if(posTicket == 0)
+            continue;
+
+         ENUM_DEAL_ENTRY posEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(posTicket, DEAL_ENTRY);
+
+         if(posEntry == DEAL_ENTRY_IN)
+         {
+            // Opening deal — get open time, open price
+            openTime     = (datetime)HistoryDealGetInteger(posTicket, DEAL_TIME);
+            openPrice    = HistoryDealGetDouble(posTicket, DEAL_PRICE);
+            openDateStr  = TimeToString(openTime, TIME_DATE);
+            openHourStr  = TimeToString(openTime, TIME_SECONDS);
+
+            // Get type from opening deal
+            long openType = HistoryDealGetInteger(posTicket, DEAL_TYPE);
+            if(openType == DEAL_TYPE_BUY)       typeStr = "buy";
+            else if(openType == DEAL_TYPE_SELL)  typeStr = "sell";
+
+            // Try to get SL/TP from the order
+            ulong orderTicket = (ulong)HistoryDealGetInteger(posTicket, DEAL_ORDER);
+            if(HistoryOrderSelect(orderTicket))
+            {
+               sl = HistoryOrderGetDouble(orderTicket, ORDER_SL);
+               tp = HistoryOrderGetDouble(orderTicket, ORDER_TP);
+            }
+         }
+         else if(posEntry == DEAL_ENTRY_OUT || posEntry == DEAL_ENTRY_INOUT)
+         {
+            // Closing deal
+            closeTime  = (datetime)HistoryDealGetInteger(posTicket, DEAL_TIME);
+            closePrice = HistoryDealGetDouble(posTicket, DEAL_PRICE);
+         }
+      }
+   }
+
+   // Restore full history selection
+   HistorySelect(0, TimeCurrent());
+
+   string closeDateStr = TimeToString(closeTime, TIME_DATE);
+   string closeHourStr = TimeToString(closeTime, TIME_SECONDS);
+   int    digits       = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+
+   // Write row
+   FileWrite(handle,
+      openDateStr,
+      openHourStr,
+      symbol,
+      IntegerToString((long)posID),
+      typeStr,
+      DoubleToString(volume, 2),
+      DoubleToString(openPrice, digits),
+      DoubleToString(sl, digits),
+      DoubleToString(tp, digits),
+      closeDateStr,
+      closeHourStr,
+      DoubleToString(closePrice, digits),
+      DoubleToString(profit, 2),
+      comment
+   );
+
+   FileClose(handle);
+
+   // Update dashboard status
+   MqlDateTime dt;
+   TimeToStruct(GetLocalTime(), dt);
+   g_lastExportTime = StringFormat("%02d:%02d:%02d", dt.hour, dt.min, dt.sec);
+   g_csvStatus = "CREATED";
+
+   Print("[EXPORTER] Exported: ", symbol, " | ", typeStr, " | ", DoubleToString(volume, 2), " lots | P/L: $", DoubleToString(profit, 2));
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 10/10 — Dashboard Functions
+//  Creates, updates and deletes all dashboard visual objects on the chart
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CreateDashboard()
+{
+   int x  = InpDashboardX;
+   int y  = InpDashboardY;
+   int w  = InpDashboardWidth;
+   int h  = InpDashboardHeight;
+   int sp = InpDashRowSpacing;
+
+   // ── Background panel ──
+   if(ObjectFind(0, "MP_BG") >= 0) ObjectDelete(0, "MP_BG");
+   ObjectCreate(0, "MP_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_XDISTANCE,   x);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_YDISTANCE,   y);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_XSIZE,       w);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_YSIZE,       h);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_BGCOLOR,     InpDashBgColor);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_COLOR,       InpDashBorderColor);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_WIDTH,       2);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_BACK,        false);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_SELECTABLE,  false);
+
+   // ── Title ──
+   int titleY = y + 20;
+   CreateLabel("MP_TITLE", "TRADE EXPORTER — MICHELE PIAZZOLI", x + 20, titleY, InpDashTitleColor, InpDashTitleSize, InpDashFont + " Bold");
+
+   // ── Separator ──
+   int sepY = titleY + InpDashTitleSize + 15;
+   if(ObjectFind(0, "MP_SEP1") >= 0) ObjectDelete(0, "MP_SEP1");
+   ObjectCreate(0, "MP_SEP1", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_XDISTANCE,  x + 15);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_YDISTANCE,  sepY);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_XSIZE,      w - 30);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_YSIZE,      1);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_BGCOLOR,    InpDashBorderColor);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_COLOR,      InpDashBorderColor);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_BACK,       false);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_SELECTABLE, false);
+
+   // ── Data rows ──
+   int row1Y = sepY + 20;
+   int row2Y = row1Y + sp;
+   int row3Y = row2Y + sp;
+   int row4Y = row3Y + sp;
+   int row5Y = row4Y + sp;
+   int valX  = x + 250;
+
+   // Row 1: CSV Status
+   CreateLabel("MP_LBL_STATUS",    "CSV Status:",          x + 20, row1Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_STATUS",    g_csvStatus,             valX,   row1Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 2: CSV Path
+   CreateLabel("MP_LBL_PATH",      "CSV Path:",            x + 20, row2Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_PATH",      g_csvFilePath,           valX,   row2Y, InpDashValueColor, InpDashLabelSize, InpDashFont);
+
+   // Row 3: Last Export
+   CreateLabel("MP_LBL_LAST",      "Last Export:",          x + 20, row3Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_LAST",      g_lastExportTime,        valX,   row3Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 4: Exports Today
+   CreateLabel("MP_LBL_COUNT",     "Exports Today:",       x + 20, row4Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_COUNT",     "0",                     valX,   row4Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+}
+
+void UpdateDashboard()
+{
+   // CSV Status
+   ObjectSetString(0, "MP_VAL_STATUS", OBJPROP_TEXT, g_csvStatus);
+   ObjectSetInteger(0, "MP_VAL_STATUS", OBJPROP_COLOR, g_csvStatus == "CREATED" ? clrLime : InpDashValueColor);
+
+   // CSV Path
+   ObjectSetString(0, "MP_VAL_PATH", OBJPROP_TEXT, g_csvFilePath);
+
+   // Last Export
+   ObjectSetString(0, "MP_VAL_LAST", OBJPROP_TEXT, g_lastExportTime);
+
+   // Exports Today
+   ObjectSetString(0, "MP_VAL_COUNT", OBJPROP_TEXT, IntegerToString(g_exportedToday));
+   ObjectSetInteger(0, "MP_VAL_COUNT", OBJPROP_COLOR, g_exportedToday > 0 ? clrLime : InpDashValueColor);
+
+   ChartRedraw(0);
+}
+
+void DeleteDashboard()
+{
+   string objects[] = {
+      "MP_BG", "MP_TITLE", "MP_SEP1",
+      "MP_LBL_STATUS",  "MP_VAL_STATUS",
+      "MP_LBL_PATH",    "MP_VAL_PATH",
+      "MP_LBL_LAST",    "MP_VAL_LAST",
+      "MP_LBL_COUNT",   "MP_VAL_COUNT",
+      "MP_LBL_TOTAL",   "MP_VAL_TOTAL"
+   };
+
+   for(int i = 0; i < ArraySize(objects); i++)
+      ObjectDelete(0, objects[i]);
+}
+
+void CreateLabel(string name, string text, int x, int y, color clr, int size, string font)
+{
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,     clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  size);
+   ObjectSetString(0, name, OBJPROP_FONT,       font);
+   ObjectSetString(0, name, OBJPROP_TEXT,        text);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR,    ANCHOR_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_BACK,      false);
+}
