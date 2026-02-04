@@ -1,1 +1,919 @@
 
+#property strict
+#property copyright "Michele Piazzoli"
+#property version   "1.0"
+#property description "Bridge EA - TradingView to MT5 Trade Execution"
+#property description "Reads alerts from CSV file and executes trades automatically"
+#property description "Includes Friday auto-close system and live dashboard"
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  INPUT PARAMETERS
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// ── Timezone ──
+input int         InpTimezoneOffset     = -1;              // Timezone Offset (hours from broker time)
+
+// ── Dashboard Position ──
+input int         InpDashboardX         = 20;              // Dashboard X Position
+input int         InpDashboardY         = 50;              // Dashboard Y Position
+input int         InpDashboardWidth     = 700;             // Dashboard Width
+input int         InpDashboardHeight    = 500;             // Dashboard Height
+
+// ── Dashboard Style ──
+input color       InpDashBgColor        = clrBlack;        // Dashboard Background Color
+input color       InpDashBorderColor    = clrDarkGray;     // Dashboard Border Color
+input color       InpDashTitleColor     = clrWhite;        // Title Text Color
+input color       InpDashLabelColor     = clrSilver;       // Label Text Color
+input color       InpDashValueColor     = clrAqua;         // Value Text Color
+input string      InpDashFont           = "Arial";         // Dashboard Font
+input int         InpDashTitleSize      = 18;              // Title Font Size
+input int         InpDashLabelSize      = 14;              // Label Font Size
+input int         InpDashRowSpacing     = 45;              // Vertical Spacing Between Rows
+
+// ── Trade Execution ──
+input int         InpSlippage           = 10;              // Max Slippage (points)
+input long        InpMagicNumber        = 123456;          // Magic Number
+
+// ── Friday Close ──
+input bool        InpFridayCloseEnabled = true;            // Enable Friday Auto-Close
+input int         InpFridayCloseHourUTC = 19;              // Friday Close Hour (UTC broker time)
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  ALERT DATA STRUCTURE
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+struct AlertData
+{
+   string   timestampReceived;     // Alert reception timestamp from TradingView (ISO format)
+   string   asset;                 // Asset symbol (e.g. XAUUSD.pro)
+   string   direction;             // Trade direction: "buy" or "sell"
+   string   userId;                // User ID field from CSV
+   string   comments;              // Trade comment (strategy name identifier)
+   string   stopLoss;              // Stop Loss value in pips from CSV
+   string   takeProfit;            // Take Profit value in pips from CSV
+   string   lots;                  // Trade volume from CSV
+   string   tradeId;               // Unique trade ID for duplicate prevention
+   string   timestampExecution;    // Filled after execution with local timestamp
+   string   executionConfirm;      // Set to "executed" after successful order
+   int      rowNumber;             // CSV row index for post-execution update
+};
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  GLOBAL VARIABLES
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+string   g_currentDayPath      = "";         // Current day folder path (Capitalbridge/YYYY/MM/DD)
+string   g_csvFilePath         = "";         // Full CSV file path (alerts_sendbox.csv)
+datetime g_lastCSVModification = 0;          // Last CSV file modification timestamp
+string   g_executedTradeIds[];               // Array of executed trade IDs for duplicate check
+datetime g_eaStartTimestamp    = 0;          // EA start timestamp to skip old alerts
+string   g_lastTradeTime       = "N/A";      // Last trade time string for dashboard display
+datetime g_lastCountdownPrint  = 0;          // Last Friday Close countdown log timestamp
+bool     g_fridayCloseExecuted = false;      // Flag to prevent multiple Friday closures
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 1/18 — GetLocalTime
+//  Applies timezone offset to broker time and returns adjusted local datetime
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+datetime GetLocalTime()
+{
+   return TimeCurrent() + (InpTimezoneOffset * 3600);
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 2/18 — OnInit
+//  Expert Advisor initialization: validates environment, builds file paths, creates dashboard
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+int OnInit()
+{
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  CAPITALBRIDGE EA 1.0 — Michele Piazzoli");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   g_eaStartTimestamp = GetLocalTime();
+
+   Print("[INIT] Broker Time:     ", TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS));
+   Print("[INIT] Local Time:      ", TimeToString(g_eaStartTimestamp, TIME_DATE | TIME_SECONDS));
+   Print("[INIT] Timezone Offset: ", InpTimezoneOffset, " hours");
+   Print("[INIT] Account:         ", AccountInfoInteger(ACCOUNT_LOGIN));
+   Print("[INIT] Balance:         $", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2));
+   Print("[INIT] Magic Number:    ", InpMagicNumber);
+   Print("[INIT] Friday Close:    ", InpFridayCloseEnabled ? "ON" : "OFF");
+
+   ArrayResize(g_executedTradeIds, 0);
+
+   if(!BuildDayPath())
+   {
+      Print("[ERROR] Unable to build day path");
+      return INIT_FAILED;
+   }
+
+   if(!FileIsExist(g_csvFilePath))
+   {
+      if(!CreateCSVFile())
+      {
+         Print("[ERROR] Unable to create CSV file");
+         return INIT_FAILED;
+      }
+      Print("[INIT] CSV created: ", g_csvFilePath);
+   }
+   else
+   {
+      Print("[INIT] CSV found:   ", g_csvFilePath);
+   }
+
+   CreateDashboard();
+   UpdateDashboard();
+
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  EA READY — Active monitoring");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   return INIT_SUCCEEDED;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 3/18 — OnDeinit
+//  Expert Advisor shutdown: removes dashboard objects from chart
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void OnDeinit(const int reason)
+{
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  CAPITALBRIDGE EA 1.0 — SHUTDOWN");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   DeleteDashboard();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 4/18 — OnTick
+//  Main loop: checks day change, reads CSV for new alerts, updates dashboard, manages Friday close
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void OnTick()
+{
+   CheckDayChange();
+
+   if(HasCSVChanged())
+      ProcessAlerts();
+
+   UpdateDashboard();
+
+   if(InpFridayCloseEnabled)
+      ManageFridayClose();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 5/18 — BuildDayPath
+//  Constructs folder path and CSV file path based on current local date (YYYY/MM/DD)
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+bool BuildDayPath()
+{
+   MqlDateTime dt;
+   TimeToStruct(GetLocalTime(), dt);
+
+   g_currentDayPath = "Capitalbridge\\"
+                    + IntegerToString(dt.year) + "\\"
+                    + StringFormat("%02d", dt.mon) + "\\"
+                    + StringFormat("%02d", dt.day);
+
+   g_csvFilePath = g_currentDayPath + "\\alerts_sendbox.csv";
+
+   return true;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 6/18 — CreateCSVFile
+//  Creates a new CSV file with header row when no file exists for the current day
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+bool CreateCSVFile()
+{
+   int handle = FileOpen(g_csvFilePath, FILE_WRITE | FILE_ANSI);
+
+   if(handle == INVALID_HANDLE)
+      return false;
+
+   FileWriteString(handle, "timestampReceived,asset,direction,userId,comments,stopLoss,takeProfit,lots,tradeId,timestampExecution,executionConfirm\n");
+   FileClose(handle);
+
+   return true;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 7/18 — CheckDayChange
+//  Detects midnight rollover, rebuilds file paths and resets daily state variables
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CheckDayChange()
+{
+   static int lastDay = 0;
+
+   MqlDateTime dt;
+   TimeToStruct(GetLocalTime(), dt);
+
+   if(lastDay == dt.day)
+      return;
+
+   lastDay = dt.day;
+
+   BuildDayPath();
+   g_lastCSVModification = 0;
+   ArrayResize(g_executedTradeIds, 0);
+   g_lastTradeTime        = "N/A";
+   g_lastCountdownPrint   = 0;
+   g_fridayCloseExecuted  = false;
+
+   if(!FileIsExist(g_csvFilePath))
+      CreateCSVFile();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 8/18 — HasCSVChanged
+//  Compares CSV file modification timestamp to detect new alerts written by the middleware
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+bool HasCSVChanged()
+{
+   datetime modTime = (datetime)FileGetInteger(g_csvFilePath, FILE_MODIFY_DATE);
+
+   if(modTime > g_lastCSVModification)
+   {
+      g_lastCSVModification = modTime;
+      return true;
+   }
+
+   return false;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 9/18 — IsTradeIdExecuted
+//  Checks if a trade ID has already been processed to prevent duplicate order execution
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+bool IsTradeIdExecuted(string tradeId)
+{
+   for(int i = 0; i < ArraySize(g_executedTradeIds); i++)
+   {
+      if(g_executedTradeIds[i] == tradeId)
+         return true;
+   }
+
+   return false;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 10/18 — RegisterTradeId
+//  Adds a trade ID to the executed array after successful order placement
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void RegisterTradeId(string tradeId)
+{
+   int size = ArraySize(g_executedTradeIds);
+   ArrayResize(g_executedTradeIds, size + 1);
+   g_executedTradeIds[size] = tradeId;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 11/18 — ParseTimestamp
+//  Converts ISO timestamp string (YYYY-MM-DDTHH:MM:SS) to MQL5 datetime value
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+datetime ParseTimestamp(string timestamp)
+{
+   if(StringLen(timestamp) < 19)
+      return 0;
+
+   StringReplace(timestamp, "T", " ");
+   StringReplace(timestamp, "Z", "");
+
+   string parts[];
+   if(StringSplit(timestamp, ' ', parts) < 2)
+      return 0;
+
+   string dateParts[];
+   if(StringSplit(parts[0], '-', dateParts) != 3)
+      return 0;
+
+   string timeParts[];
+   if(StringSplit(parts[1], ':', timeParts) < 2)
+      return 0;
+
+   MqlDateTime dt;
+   ZeroMemory(dt);
+
+   dt.year = (int)StringToInteger(dateParts[0]);
+   dt.mon  = (int)StringToInteger(dateParts[1]);
+   dt.day  = (int)StringToInteger(dateParts[2]);
+   dt.hour = (int)StringToInteger(timeParts[0]);
+   dt.min  = (int)StringToInteger(timeParts[1]);
+
+   if(ArraySize(timeParts) >= 3)
+      dt.sec = (int)StringToInteger(timeParts[2]);
+
+   return StructToTime(dt);
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 12/18 — ProcessAlerts
+//  Reads the CSV file, filters valid unexecuted alerts, and sends each to ExecuteTrade
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void ProcessAlerts()
+{
+   int handle = FileOpen(g_csvFilePath, FILE_READ | FILE_ANSI);
+
+   if(handle == INVALID_HANDLE)
+   {
+      Print("[ERROR] Unable to open CSV: ", g_csvFilePath);
+      return;
+   }
+
+   AlertData pending[];
+   int count = 0;
+   int row   = 1;
+
+   FileReadString(handle);  // Skip header row
+
+   while(!FileIsEnding(handle))
+   {
+      string line = FileReadString(handle);
+
+      if(StringLen(line) < 5)
+      {
+         row++;
+         continue;
+      }
+
+      string cols[];
+      if(StringSplit(line, ',', cols) < 9)
+      {
+         row++;
+         continue;
+      }
+
+      // Skip already confirmed rows
+      if(ArraySize(cols) >= 11 && cols[10] == "executed")
+      {
+         row++;
+         continue;
+      }
+
+      // Skip already executed in memory
+      if(IsTradeIdExecuted(cols[8]))
+      {
+         row++;
+         continue;
+      }
+
+      // Skip alerts older than EA start
+      datetime alertTime = ParseTimestamp(cols[0]);
+      if(alertTime > 0 && alertTime < g_eaStartTimestamp)
+      {
+         row++;
+         continue;
+      }
+
+      AlertData alert;
+      alert.timestampReceived  = cols[0];
+      alert.asset              = cols[1];
+      alert.direction          = cols[2];
+      alert.userId             = cols[3];
+      alert.comments           = cols[4];
+      alert.stopLoss           = cols[5];
+      alert.takeProfit         = cols[6];
+      alert.lots               = cols[7];
+      alert.tradeId            = cols[8];
+      alert.timestampExecution = (ArraySize(cols) >= 10) ? cols[9]  : "";
+      alert.executionConfirm   = (ArraySize(cols) >= 11) ? cols[10] : "";
+      alert.rowNumber          = row;
+
+      ArrayResize(pending, count + 1);
+      pending[count] = alert;
+      count++;
+      row++;
+   }
+
+   FileClose(handle);
+
+   if(count > 0)
+   {
+      Print("══════════════════════════════════════════════════════════════════════════");
+      Print("  PROCESSING ", count, " NEW ALERT(S)");
+      Print("══════════════════════════════════════════════════════════════════════════");
+   }
+
+   for(int i = 0; i < count; i++)
+      ExecuteTrade(pending[i]);
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 13/18 — ExecuteTrade
+//  Builds and sends a market order from parsed alert data, updates CSV on success
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void ExecuteTrade(AlertData &alert)
+{
+   string symbol  = alert.asset;
+   double slPips  = StringToDouble(alert.stopLoss);
+   double tpPips  = StringToDouble(alert.takeProfit);
+   double lots    = StringToDouble(alert.lots);
+
+   if(lots <= 0)
+   {
+      Print("[ERROR] Invalid lots value: ", alert.lots);
+      return;
+   }
+
+   // Determine order direction
+   ENUM_ORDER_TYPE orderType;
+
+   if(alert.direction == "buy")
+      orderType = ORDER_TYPE_BUY;
+   else if(alert.direction == "sell")
+      orderType = ORDER_TYPE_SELL;
+   else
+   {
+      Print("[ERROR] Invalid direction: ", alert.direction);
+      return;
+   }
+
+   // Get execution price
+   double price = (orderType == ORDER_TYPE_BUY)
+                  ? SymbolInfoDouble(symbol, SYMBOL_ASK)
+                  : SymbolInfoDouble(symbol, SYMBOL_BID);
+
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+
+   // Calculate SL and TP price levels
+   double sl = 0;
+   double tp = 0;
+
+   if(slPips > 0)
+   {
+      if(orderType == ORDER_TYPE_BUY)
+         sl = price - (slPips * 10 * point);
+      else
+         sl = price + (slPips * 10 * point);
+   }
+
+   if(tpPips > 0)
+   {
+      if(orderType == ORDER_TYPE_BUY)
+         tp = price + (tpPips * 10 * point);
+      else
+         tp = price - (tpPips * 10 * point);
+   }
+
+   // Build order request
+   MqlTradeRequest request;
+   MqlTradeResult  result;
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   request.action       = TRADE_ACTION_DEAL;
+   request.symbol       = symbol;
+   request.volume       = lots;
+   request.type         = orderType;
+   request.price        = price;
+   request.sl           = sl;
+   request.tp           = tp;
+   request.deviation    = InpSlippage;
+   request.magic        = InpMagicNumber;
+   request.comment      = alert.comments;
+   request.type_filling = ORDER_FILLING_FOK;
+
+   Print("──────────────────────────────────────────────────────────────────────────");
+   Print("  EXECUTING: ", alert.comments, " | ", alert.direction, " ", lots, " ", symbol);
+   Print("──────────────────────────────────────────────────────────────────────────");
+
+   bool sent = OrderSend(request, result);
+
+   if(sent && result.retcode == TRADE_RETCODE_DONE)
+   {
+      Print("[OK] Ticket: ", result.order, " | Strategy: ", alert.comments, " | Lots: ", lots);
+
+      // Update dashboard timestamp
+      MqlDateTime dt;
+      TimeToStruct(GetLocalTime(), dt);
+      g_lastTradeTime = StringFormat("%02d:%02d:%02d", dt.hour, dt.min, dt.sec);
+
+      MarkAlertExecuted(alert);
+      RegisterTradeId(alert.tradeId);
+   }
+   else
+   {
+      Print("[ERROR] Retcode: ", result.retcode, " — ", GetRetcodeDescription(result.retcode));
+   }
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 14/18 — MarkAlertExecuted
+//  Rewrites the CSV file updating the executed alert row with timestamp and confirmation flag
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void MarkAlertExecuted(AlertData &alert)
+{
+   // Read all lines
+   int handleRead = FileOpen(g_csvFilePath, FILE_READ | FILE_ANSI);
+
+   if(handleRead == INVALID_HANDLE)
+      return;
+
+   string lines[];
+   int lineCount = 0;
+
+   while(!FileIsEnding(handleRead))
+   {
+      ArrayResize(lines, lineCount + 1);
+      lines[lineCount] = FileReadString(handleRead);
+      lineCount++;
+   }
+
+   FileClose(handleRead);
+
+   // Update the target row
+   if(alert.rowNumber > 0 && alert.rowNumber < lineCount)
+   {
+      MqlDateTime dt;
+      TimeToStruct(GetLocalTime(), dt);
+      int ms = (int)(GetTickCount() % 1000);
+
+      string execTimestamp = StringFormat("%04d-%02d-%02d %02d:%02d:%02d.%03d",
+                                          dt.year, dt.mon, dt.day,
+                                          dt.hour, dt.min, dt.sec, ms);
+
+      lines[alert.rowNumber] = alert.timestampReceived + ","
+                              + alert.asset + ","
+                              + alert.direction + ","
+                              + alert.userId + ","
+                              + alert.comments + ","
+                              + alert.stopLoss + ","
+                              + alert.takeProfit + ","
+                              + alert.lots + ","
+                              + alert.tradeId + ","
+                              + execTimestamp + ","
+                              + "executed";
+   }
+
+   // Write all lines back
+   int handleWrite = FileOpen(g_csvFilePath, FILE_WRITE | FILE_ANSI);
+
+   if(handleWrite == INVALID_HANDLE)
+      return;
+
+   for(int i = 0; i < lineCount; i++)
+      FileWriteString(handleWrite, lines[i] + "\n");
+
+   FileClose(handleWrite);
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 15/18 — GetRetcodeDescription
+//  Returns human-readable description for MT5 trade server return codes
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+string GetRetcodeDescription(uint retcode)
+{
+   switch(retcode)
+   {
+      case 10004: return "REQUOTE — Price changed";
+      case 10006: return "REJECT — Request rejected";
+      case 10007: return "CANCEL — Request cancelled";
+      case 10008: return "PLACED — Order placed";
+      case 10009: return "DONE — Order executed";
+      case 10010: return "DONE_PARTIAL — Partially executed";
+      case 10011: return "ERROR — Not executed";
+      case 10012: return "TIMEOUT — Timeout";
+      case 10013: return "INVALID — Invalid request";
+      case 10014: return "INVALID_VOLUME — Invalid volume";
+      case 10015: return "INVALID_PRICE — Invalid price";
+      case 10016: return "INVALID_STOPS — Invalid SL/TP";
+      case 10017: return "TRADE_DISABLED — Trading disabled";
+      case 10018: return "MARKET_CLOSED — Market closed";
+      case 10019: return "NO_MONEY — Insufficient funds";
+      case 10020: return "PRICE_CHANGED — Price changed";
+      case 10021: return "PRICE_OFF — No quotes available";
+      case 10022: return "INVALID_EXPIRATION — Invalid expiration";
+      case 10023: return "ORDER_CHANGED — Order modified";
+      case 10024: return "TOO_MANY_REQUESTS — Too many requests";
+      case 10025: return "NO_CHANGES — No changes detected";
+      case 10026: return "SERVER_AT_OFF — Server autotrading OFF";
+      case 10027: return "CLIENT_AT_OFF — Client autotrading OFF";
+      case 10028: return "LOCKED — Request locked";
+      case 10029: return "FROZEN — Order frozen";
+      case 10030: return "INVALID_FILL — Invalid filling mode";
+      case 10031: return "CONNECTION — No connection";
+      case 10032: return "ONLY_REAL — Real accounts only";
+      case 10033: return "LIMIT_ORDERS — Max orders reached";
+      case 10034: return "LIMIT_VOLUME — Max volume reached";
+      case 10035: return "INVALID_ORDER — Incorrect order";
+      case 10036: return "POSITION_CLOSED — Already closed";
+      default:    return "UNKNOWN (" + IntegerToString(retcode) + ")";
+   }
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 16/18 — ManageFridayClose
+//  Monitors time for Friday auto-close, prints countdown every 3 hours, triggers CloseAllPositions
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void ManageFridayClose()
+{
+   datetime localTime = GetLocalTime();
+
+   // Countdown log every 3 hours
+   if((localTime - g_lastCountdownPrint) >= 10800)
+   {
+      datetime nextClose = CalculateNextFridayClose(localTime);
+      int remaining = (int)(nextClose - localTime);
+
+      if(remaining > 0)
+      {
+         int days  = remaining / 86400;
+         int hours = (remaining % 86400) / 3600;
+         int mins  = (remaining % 3600) / 60;
+
+         Print("══════════════════════════════════════════════════════════════════════════");
+
+         if(days > 0)
+            Print("[FRIDAY CLOSE] ", days, "d ", hours, "h remaining");
+         else if(hours > 0)
+            Print("[FRIDAY CLOSE] ", hours, "h ", mins, "m remaining");
+         else
+            Print("[FRIDAY CLOSE] ", mins, "m remaining");
+
+         Print("══════════════════════════════════════════════════════════════════════════");
+      }
+
+      g_lastCountdownPrint = localTime;
+   }
+
+   // Check if it's time to close
+   MqlDateTime dtUTC;
+   TimeToStruct(TimeCurrent(), dtUTC);
+
+   if(dtUTC.day_of_week == 5 && dtUTC.hour == InpFridayCloseHourUTC && dtUTC.min == 0 && !g_fridayCloseExecuted)
+   {
+      CloseAllPositions();
+      g_fridayCloseExecuted = true;
+   }
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 17/18 — CalculateNextFridayClose
+//  Calculates datetime of the next Friday close event based on current local time
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+datetime CalculateNextFridayClose(datetime currentTime)
+{
+   MqlDateTime dt;
+   TimeToStruct(currentTime, dt);
+
+   int daysToFriday = 5 - dt.day_of_week;
+
+   if(daysToFriday < 0)
+      daysToFriday += 7;
+
+   if(daysToFriday == 0 && dt.hour >= 20)
+      daysToFriday = 7;
+
+   dt.hour = 20;
+   dt.min  = 0;
+   dt.sec  = 0;
+
+   return StructToTime(dt) + (daysToFriday * 86400);
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 18/18 — CloseAllPositions
+//  Closes every open position and saves a text report to the fridayclosetradereport folder
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CloseAllPositions()
+{
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  FRIDAY CLOSE — AUTOMATIC CLOSURE");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   MqlDateTime dt;
+   TimeToStruct(GetLocalTime(), dt);
+
+   string report = "CAPITALBRIDGE EA — FRIDAY CLOSE REPORT\n";
+   report += "Michele Piazzoli\n";
+   report += "══════════════════════════════════════════\n\n";
+   report += StringFormat("Date: %04d-%02d-%02d %02d:%02d:%02d\n\n", dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec);
+
+   int closed = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      string symbol               = PositionGetString(POSITION_SYMBOL);
+      ENUM_POSITION_TYPE type     = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double volume               = PositionGetDouble(POSITION_VOLUME);
+      double openPrice            = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentPrice         = PositionGetDouble(POSITION_PRICE_CURRENT);
+      double profit               = PositionGetDouble(POSITION_PROFIT);
+      datetime openTime           = (datetime)PositionGetInteger(POSITION_TIME);
+      string typeStr              = (type == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+
+      report += StringFormat("Ticket: %I64u | %s %s %.2f lots\n", ticket, typeStr, symbol, volume);
+      report += StringFormat("Open: %.5f | Current: %.5f | P/L: $%.2f\n", openPrice, currentPrice, profit);
+      report += StringFormat("Opened: %s\n", TimeToString(openTime, TIME_DATE | TIME_SECONDS));
+      report += "──────────────────────────────────────────\n";
+
+      // Build close order
+      MqlTradeRequest request;
+      MqlTradeResult  result;
+      ZeroMemory(request);
+      ZeroMemory(result);
+
+      request.action       = TRADE_ACTION_DEAL;
+      request.position     = ticket;
+      request.symbol       = symbol;
+      request.volume       = volume;
+      request.type         = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+      request.price        = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+      request.deviation    = InpSlippage;
+      request.magic        = InpMagicNumber;
+      request.comment      = "FridayClose";
+      request.type_filling = ORDER_FILLING_FOK;
+
+      if(OrderSend(request, result) && result.retcode == TRADE_RETCODE_DONE)
+      {
+         Print("[OK] Closed ticket ", ticket, " | P/L: $", DoubleToString(profit, 2));
+         closed++;
+      }
+      else
+      {
+         Print("[ERROR] Ticket ", ticket, " | Retcode: ", result.retcode);
+         report += StringFormat("ERROR: %d — %s\n", result.retcode, GetRetcodeDescription(result.retcode));
+      }
+   }
+
+   report += StringFormat("\nTOTAL CLOSED: %d\n", closed);
+
+   // Save report
+   string filename = StringFormat("fridayclosetradereport\\%04d%02d%02d_%02d%02d%02d.txt",
+                                   dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec);
+
+   int handle = FileOpen(filename, FILE_WRITE | FILE_ANSI);
+
+   if(handle != INVALID_HANDLE)
+   {
+      FileWriteString(handle, report);
+      FileClose(handle);
+      Print("[OK] Report saved: ", filename);
+   }
+
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  FRIDAY CLOSE COMPLETE — ", closed, " position(s) closed");
+   Print("══════════════════════════════════════════════════════════════════════════");
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  DASHBOARD FUNCTIONS
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CreateDashboard()
+{
+   int x  = InpDashboardX;
+   int y  = InpDashboardY;
+   int w  = InpDashboardWidth;
+   int h  = InpDashboardHeight;
+   int sp = InpDashRowSpacing;
+
+   // ── Background panel (BACK = false so it renders on top of chart, fully opaque) ──
+   if(ObjectFind(0, "MP_BG") >= 0) ObjectDelete(0, "MP_BG");
+   ObjectCreate(0, "MP_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_XDISTANCE,   x);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_YDISTANCE,   y);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_XSIZE,       w);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_YSIZE,       h);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_BGCOLOR,     InpDashBgColor);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_COLOR,       InpDashBorderColor);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_WIDTH,       2);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_BACK,        false);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_SELECTABLE,  false);
+
+   // ── Title ──
+   int titleY = y + 25;
+   CreateLabel("MP_TITLE", "BRIGE EA - MICHELE PIAZZOLI", x + 20, titleY, InpDashTitleColor, InpDashTitleSize, InpDashFont + " Bold");
+
+   // ── Separator line under title ──
+   int sepY = titleY + InpDashTitleSize + 18;
+   if(ObjectFind(0, "MP_SEP1") >= 0) ObjectDelete(0, "MP_SEP1");
+   ObjectCreate(0, "MP_SEP1", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_XDISTANCE,  x + 15);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_YDISTANCE,  sepY);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_XSIZE,      w - 30);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_YSIZE,      1);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_BGCOLOR,    InpDashBorderColor);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_COLOR,      InpDashBorderColor);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_BACK,       false);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_SELECTABLE, false);
+
+   // ── Data rows with values populated immediately ──
+   int row1Y = sepY + 25;
+   int row2Y = row1Y + sp;
+   int row3Y = row2Y + sp;
+   int row4Y = row3Y + sp;
+   int row5Y = row4Y + sp;
+   int valX  = x + 250;
+
+   // Row 1: Account Number
+   string accountStr = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+   CreateLabel("MP_LBL_ACCOUNT", "Account:",       x + 20, row1Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_ACCOUNT", accountStr,        valX,   row1Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 2: Balance
+   string balanceStr = "$" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2);
+   CreateLabel("MP_LBL_BALANCE", "Balance:",       x + 20, row2Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_BALANCE", balanceStr,        valX,   row2Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 3: CSV Status
+   string csvStr = FileIsExist(g_csvFilePath) ? "CONNECTED" : "NOT FOUND";
+   color  csvClr = FileIsExist(g_csvFilePath) ? clrLime : clrRed;
+   CreateLabel("MP_LBL_CSV",     "CSV Status:",    x + 20, row3Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_CSV",     csvStr,            valX,   row3Y, csvClr,            InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 4: Trades Today
+   CreateLabel("MP_LBL_TRADES",  "Trades Today:",  x + 20, row4Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_TRADES",  "0",              valX,   row4Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 5: Last Trade
+   CreateLabel("MP_LBL_LAST",    "Last Trade:",    x + 20, row5Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_LAST",    "N/A",            valX,   row5Y, InpDashValueColor, InpDashLabelSize, InpDashFont);
+}
+
+void UpdateDashboard()
+{
+   // Account number
+   ObjectSetString(0, "MP_VAL_ACCOUNT", OBJPROP_TEXT, IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)));
+
+   // Balance
+   ObjectSetString(0, "MP_VAL_BALANCE", OBJPROP_TEXT, "$" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2));
+
+   // Last trade time
+   ObjectSetString(0, "MP_VAL_LAST", OBJPROP_TEXT, g_lastTradeTime);
+
+   // CSV status
+   if(FileIsExist(g_csvFilePath))
+   {
+      ObjectSetString(0, "MP_VAL_CSV", OBJPROP_TEXT, "CONNECTED");
+      ObjectSetInteger(0, "MP_VAL_CSV", OBJPROP_COLOR, clrLime);
+   }
+   else
+   {
+      ObjectSetString(0, "MP_VAL_CSV", OBJPROP_TEXT, "NOT FOUND");
+      ObjectSetInteger(0, "MP_VAL_CSV", OBJPROP_COLOR, clrRed);
+   }
+
+   // Trades count
+   ObjectSetString(0, "MP_VAL_TRADES", OBJPROP_TEXT, IntegerToString(ArraySize(g_executedTradeIds)));
+
+   ChartRedraw(0);
+}
+
+void DeleteDashboard()
+{
+   string objects[] = {
+      "MP_BG", "MP_TITLE", "MP_SEP1",
+      "MP_LBL_ACCOUNT", "MP_VAL_ACCOUNT",
+      "MP_LBL_BALANCE", "MP_VAL_BALANCE",
+      "MP_LBL_CSV",     "MP_VAL_CSV",
+      "MP_LBL_TRADES",  "MP_VAL_TRADES",
+      "MP_LBL_LAST",    "MP_VAL_LAST"
+   };
+
+   for(int i = 0; i < ArraySize(objects); i++)
+      ObjectDelete(0, objects[i]);
+}
+
+void CreateLabel(string name, string text, int x, int y, color clr, int size, string font)
+{
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,     clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  size);
+   ObjectSetString(0, name, OBJPROP_FONT,       font);
+   ObjectSetString(0, name, OBJPROP_TEXT,        text);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR,    ANCHOR_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_BACK,      false);
+}
