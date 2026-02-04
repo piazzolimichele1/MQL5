@@ -1,0 +1,145 @@
+#property strict
+#property copyright "Michele Piazzoli"
+#property version   "1.0"
+#property description "Multi-Timeframe EMA Dashboard"
+#property description "Shows EMA 9/21/50/200 alignment across M15, H1, H4, D1, W1"
+#property indicator_chart_window
+#property indicator_plots 0
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  INPUT PARAMETERS
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+input int         InpEma1                 = 9;               // EMA 1 Period
+input int         InpEma2                 = 21;              // EMA 2 Period
+input int         InpEma3                 = 50;              // EMA 3 Period
+input int         InpEma4                 = 200;             // EMA 4 Period
+
+input int         InpDashboardX           = 20;
+input int         InpDashboardY           = 50;
+input int         InpDashboardWidth       = 700;
+input int         InpDashboardHeight      = 250;
+input color       InpDashBgColor          = clrBlack;
+input color       InpDashBorderColor      = clrDarkGray;
+input color       InpDashTitleColor       = clrWhite;
+input color       InpDashLabelColor       = clrSilver;
+input string      InpDashFont             = "Arial";
+input int         InpDashTitleSize        = 16;
+input int         InpDashLabelSize        = 11;
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+ENUM_TIMEFRAMES g_timeframes[] = {PERIOD_M15, PERIOD_H1, PERIOD_H4, PERIOD_D1, PERIOD_W1};
+string          g_tfNames[]    = {"M15", "H1", "H4", "D1", "W1"};
+int             g_emaHandles[5][4];   // [timeframe][ema_index]
+
+int OnInit()
+{
+   for(int t = 0; t < 5; t++)
+      for(int e = 0; e < 4; e++)
+      {
+         int period = (e==0?InpEma1:e==1?InpEma2:e==2?InpEma3:InpEma4);
+         g_emaHandles[t][e] = iMA(_Symbol, g_timeframes[t], period, 0, MODE_EMA, PRICE_CLOSE);
+      }
+
+   CreateDashboard();
+   EventSetTimer(10);
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   for(int t=0;t<5;t++) for(int e=0;e<4;e++) if(g_emaHandles[t][e]!=INVALID_HANDLE) IndicatorRelease(g_emaHandles[t][e]);
+   EventKillTimer();
+   DeleteDashboard();
+}
+
+int OnCalculate(const int rates_total,const int prev_calculated,const datetime &time[],const double &open[],const double &high[],const double &low[],const double &close[],const long &tick_volume[],const long &volume[],const int &spread[])
+{
+   UpdateDashboard();
+   return rates_total;
+}
+
+void OnTimer() { UpdateDashboard(); }
+
+void CreateDashboard()
+{
+   int x=InpDashboardX,y=InpDashboardY,w=InpDashboardWidth,h=InpDashboardHeight;
+
+   if(ObjectFind(0,"MP_BG")>=0)ObjectDelete(0,"MP_BG");
+   ObjectCreate(0,"MP_BG",OBJ_RECTANGLE_LABEL,0,0,0);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_XDISTANCE,x);ObjectSetInteger(0,"MP_BG",OBJPROP_YDISTANCE,y);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_XSIZE,w);ObjectSetInteger(0,"MP_BG",OBJPROP_YSIZE,h);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_BGCOLOR,InpDashBgColor);ObjectSetInteger(0,"MP_BG",OBJPROP_BORDER_TYPE,BORDER_FLAT);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_COLOR,InpDashBorderColor);ObjectSetInteger(0,"MP_BG",OBJPROP_WIDTH,2);
+   ObjectSetInteger(0,"MP_BG",OBJPROP_BACK,false);ObjectSetInteger(0,"MP_BG",OBJPROP_SELECTABLE,false);
+
+   int tY=y+15;
+   CreateLabel("MP_TITLE","MTF EMA DASHBOARD — MICHELE PIAZZOLI",x+20,tY,InpDashTitleColor,InpDashTitleSize,InpDashFont+" Bold");
+
+   // Column headers
+   int headerY = tY + InpDashTitleSize + 20;
+   int col0=x+20, col1=x+100, col2=x+230, col3=x+360, col4=x+490, col5=x+600;
+   CreateLabel("MP_HDR_TF","Timeframe",col0,headerY,InpDashLabelColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_HDR_E1","EMA "+IntegerToString(InpEma1),col1,headerY,InpDashLabelColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_HDR_E2","EMA "+IntegerToString(InpEma2),col2,headerY,InpDashLabelColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_HDR_E3","EMA "+IntegerToString(InpEma3),col3,headerY,InpDashLabelColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_HDR_E4","EMA "+IntegerToString(InpEma4),col4,headerY,InpDashLabelColor,InpDashLabelSize,InpDashFont+" Bold");
+   CreateLabel("MP_HDR_BIAS","Bias",col5,headerY,InpDashLabelColor,InpDashLabelSize,InpDashFont+" Bold");
+
+   // Rows
+   for(int t=0;t<5;t++)
+   {
+      int rowY = headerY + 25 + t * 28;
+      string pfx = "MP_R"+IntegerToString(t);
+      CreateLabel(pfx+"_TF",g_tfNames[t],col0,rowY,clrWhite,InpDashLabelSize,InpDashFont+" Bold");
+      CreateLabel(pfx+"_E1","—",col1,rowY,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+      CreateLabel(pfx+"_E2","—",col2,rowY,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+      CreateLabel(pfx+"_E3","—",col3,rowY,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+      CreateLabel(pfx+"_E4","—",col4,rowY,InpDashLabelColor,InpDashLabelSize,InpDashFont);
+      CreateLabel(pfx+"_BIAS","—",col5,rowY,InpDashLabelColor,InpDashLabelSize,InpDashFont+" Bold");
+   }
+}
+
+void UpdateDashboard()
+{
+   for(int t=0;t<5;t++)
+   {
+      string pfx="MP_R"+IntegerToString(t);
+      double close = iClose(_Symbol,g_timeframes[t],0);
+      int bullish=0, bearish=0;
+
+      for(int e=0;e<4;e++)
+      {
+         double val[1];
+         string eName = pfx+"_E"+IntegerToString(e+1);
+         if(CopyBuffer(g_emaHandles[t][e],0,0,1,val)==1)
+         {
+            ObjectSetString(0,eName,OBJPROP_TEXT,DoubleToString(val[0],_Digits));
+            if(close>val[0]){ObjectSetInteger(0,eName,OBJPROP_COLOR,clrLime);bullish++;}
+            else{ObjectSetInteger(0,eName,OBJPROP_COLOR,clrRed);bearish++;}
+         }
+      }
+
+      // Bias
+      string bias="NEUTRAL"; color biasClr=clrOrange;
+      if(bullish==4){bias="STRONG BUY";biasClr=clrLime;}
+      else if(bullish>=3){bias="BUY";biasClr=clrGreen;}
+      else if(bearish==4){bias="STRONG SELL";biasClr=clrRed;}
+      else if(bearish>=3){bias="SELL";biasClr=clrOrangeRed;}
+      ObjectSetString(0,pfx+"_BIAS",OBJPROP_TEXT,bias);
+      ObjectSetInteger(0,pfx+"_BIAS",OBJPROP_COLOR,biasClr);
+   }
+   ChartRedraw(0);
+}
+
+void DeleteDashboard()
+{
+   ObjectDelete(0,"MP_BG");ObjectDelete(0,"MP_TITLE");
+   string hdrs[]={"MP_HDR_TF","MP_HDR_E1","MP_HDR_E2","MP_HDR_E3","MP_HDR_E4","MP_HDR_BIAS"};
+   for(int i=0;i<ArraySize(hdrs);i++) ObjectDelete(0,hdrs[i]);
+   for(int t=0;t<5;t++){string p="MP_R"+IntegerToString(t);ObjectDelete(0,p+"_TF");ObjectDelete(0,p+"_E1");ObjectDelete(0,p+"_E2");ObjectDelete(0,p+"_E3");ObjectDelete(0,p+"_E4");ObjectDelete(0,p+"_BIAS");}
+}
+
+void CreateLabel(string name,string text,int x,int y,color clr,int size,string font)
+{if(ObjectFind(0,name)>=0)ObjectDelete(0,name);ObjectCreate(0,name,OBJ_LABEL,0,0,0);ObjectSetInteger(0,name,OBJPROP_XDISTANCE,x);ObjectSetInteger(0,name,OBJPROP_YDISTANCE,y);ObjectSetInteger(0,name,OBJPROP_COLOR,clr);ObjectSetInteger(0,name,OBJPROP_FONTSIZE,size);ObjectSetString(0,name,OBJPROP_FONT,font);ObjectSetString(0,name,OBJPROP_TEXT,text);ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_LEFT_UPPER);ObjectSetInteger(0,name,OBJPROP_ANCHOR,ANCHOR_LEFT_UPPER);ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);ObjectSetInteger(0,name,OBJPROP_BACK,false);}
