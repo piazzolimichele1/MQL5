@@ -1,1 +1,444 @@
+#property strict
+#property copyright "Michele Piazzoli"
+#property version   "1.0"
+#property description "Account Status EA - Live Account Monitor Dashboard"
+#property description "Displays account metrics, open positions, daily P/L and margin usage"
+#property description "Includes Close All button to close all open positions instantly"
 
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  INPUT PARAMETERS
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+// ── Timezone ──
+input int         InpTimezoneOffset       = -1;              // Timezone Offset (hours from broker time)
+
+// ── Trade Execution ──
+input int         InpSlippage             = 10;              // Max Slippage (points)
+
+// ── Dashboard Position ──
+input int         InpDashboardX           = 20;              // Dashboard X Position
+input int         InpDashboardY           = 50;              // Dashboard Y Position
+input int         InpDashboardWidth       = 700;             // Dashboard Width
+input int         InpDashboardHeight      = 300;             // Dashboard Height
+
+// ── Dashboard Style ──
+input color       InpDashBgColor          = clrBlack;        // Dashboard Background Color
+input color       InpDashBorderColor      = clrDarkGray;     // Dashboard Border Color
+input color       InpDashTitleColor       = clrWhite;        // Title Text Color
+input color       InpDashLabelColor       = clrSilver;       // Label Text Color
+input color       InpDashValueColor       = clrAqua;         // Value Text Color
+input string      InpDashFont             = "Arial";         // Dashboard Font
+input int         InpDashTitleSize        = 18;              // Title Font Size
+input int         InpDashLabelSize        = 14;              // Label Font Size
+input int         InpDashRowSpacing       = 20;              // Vertical Spacing Between Rows
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  GLOBAL VARIABLES
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+double g_startOfDayBalance = 0;        // Balance snapshot at start of day for daily P/L calculation
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 1/10 — GetLocalTime
+//  Applies timezone offset to broker time and returns adjusted local datetime
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+datetime GetLocalTime()
+{
+   return TimeCurrent() + (InpTimezoneOffset * 3600);
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 2/10 — OnInit
+//  Initialization: snapshots starting balance, creates dashboard, starts timer
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+int OnInit()
+{
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  ACCOUNT STATUS EA 1.0 — Michele Piazzoli");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   g_startOfDayBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+
+   Print("[INIT] Account:  ", AccountInfoInteger(ACCOUNT_LOGIN));
+   Print("[INIT] Balance:  $", DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2));
+   Print("[INIT] Equity:   $", DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2));
+   Print("[INIT] Leverage: 1:", AccountInfoInteger(ACCOUNT_LEVERAGE));
+
+   CreateDashboard();
+   UpdateDashboard();
+
+   EventSetTimer(60);
+
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  EA READY — Account monitoring active");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   return INIT_SUCCEEDED;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 3/10 — OnDeinit
+//  Shutdown: removes dashboard objects and kills timer
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void OnDeinit(const int reason)
+{
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  ACCOUNT STATUS EA 1.0 — SHUTDOWN");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   EventKillTimer();
+   DeleteDashboard();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 4/10 — OnTick
+//  Main loop on every price tick: updates dashboard with live account data
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void OnTick()
+{
+   CheckDayChange();
+   UpdateDashboard();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 5/10 — OnTimer
+//  Timer callback every 60 seconds: updates dashboard even without ticks
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void OnTimer()
+{
+   CheckDayChange();
+   UpdateDashboard();
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 6/10 — OnChartEvent
+//  Handles chart events: detects Close All button click and triggers position closure
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   if(id == CHARTEVENT_OBJECT_CLICK && sparam == "MP_BTN_CLOSEALL")
+   {
+      CloseAllPositions();
+
+      // Reset button state (unpress)
+      ObjectSetInteger(0, "MP_BTN_CLOSEALL", OBJPROP_STATE, false);
+
+      UpdateDashboard();
+   }
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 7/10 — CheckDayChange
+//  Detects midnight rollover and resets daily balance snapshot
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CheckDayChange()
+{
+   static int lastDay = 0;
+
+   MqlDateTime dt;
+   TimeToStruct(GetLocalTime(), dt);
+
+   if(lastDay != dt.day)
+   {
+      lastDay = dt.day;
+      g_startOfDayBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      Print("[ACCOUNT] New day — Starting balance: $", DoubleToString(g_startOfDayBalance, 2));
+   }
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 8/10 — GetTotalFloatingPL
+//  Calculates the total floating profit/loss across all open positions
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+double GetTotalFloatingPL()
+{
+   double total = 0;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0)
+         total += PositionGetDouble(POSITION_PROFIT);
+   }
+
+   return total;
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 9/10 — CloseAllPositions
+//  Closes every open position immediately with market orders
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CloseAllPositions()
+{
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  CLOSE ALL — Closing all open positions");
+   Print("══════════════════════════════════════════════════════════════════════════");
+
+   int closed = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      string symbol           = PositionGetString(POSITION_SYMBOL);
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double volume           = PositionGetDouble(POSITION_VOLUME);
+      double profit           = PositionGetDouble(POSITION_PROFIT);
+
+      MqlTradeRequest request;
+      MqlTradeResult  result;
+      ZeroMemory(request);
+      ZeroMemory(result);
+
+      request.action       = TRADE_ACTION_DEAL;
+      request.position     = ticket;
+      request.symbol       = symbol;
+      request.volume       = volume;
+      request.type         = (type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+      request.price        = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+      request.deviation    = InpSlippage;
+      request.comment      = "CloseAll";
+      request.type_filling = ORDER_FILLING_FOK;
+
+      if(OrderSend(request, result) && result.retcode == TRADE_RETCODE_DONE)
+      {
+         Print("[OK] Closed ticket ", ticket, " | P/L: $", DoubleToString(profit, 2));
+         closed++;
+      }
+      else
+      {
+         Print("[WARNING] Ticket ", ticket, " | Retcode: ", result.retcode);
+      }
+   }
+
+   Print("══════════════════════════════════════════════════════════════════════════");
+   Print("  CLOSE ALL COMPLETE — ", closed, " position(s) closed");
+   Print("══════════════════════════════════════════════════════════════════════════");
+}
+
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+//  FUNCTION 10/10 — Dashboard Functions
+//  Creates, updates and deletes all dashboard visual objects on the chart
+//══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+
+void CreateDashboard()
+{
+   int x  = InpDashboardX;
+   int y  = InpDashboardY;
+   int w  = InpDashboardWidth;
+   int h  = InpDashboardHeight;
+   int sp = InpDashRowSpacing;
+
+   // ── Background panel ──
+   if(ObjectFind(0, "MP_BG") >= 0) ObjectDelete(0, "MP_BG");
+   ObjectCreate(0, "MP_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_XDISTANCE,   x);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_YDISTANCE,   y);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_XSIZE,       w);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_YSIZE,       h);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_BGCOLOR,     InpDashBgColor);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_COLOR,       InpDashBorderColor);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_WIDTH,       2);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_BACK,        false);
+   ObjectSetInteger(0, "MP_BG", OBJPROP_SELECTABLE,  false);
+
+   // ── Title ──
+   int titleY = y + 20;
+   CreateLabel("MP_TITLE", "ACCOUNT STATUS - MICHELE PIAZZOLI", x + 20, titleY, InpDashTitleColor, InpDashTitleSize, InpDashFont + " Bold");
+
+   // ── Separator ──
+   int sepY = titleY + InpDashTitleSize + 15;
+   if(ObjectFind(0, "MP_SEP1") >= 0) ObjectDelete(0, "MP_SEP1");
+   ObjectCreate(0, "MP_SEP1", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_XDISTANCE,  x + 15);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_YDISTANCE,  sepY);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_XSIZE,      w - 30);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_YSIZE,      1);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_BGCOLOR,    InpDashBorderColor);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_COLOR,      InpDashBorderColor);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_BACK,       false);
+   ObjectSetInteger(0, "MP_SEP1", OBJPROP_SELECTABLE, false);
+
+   // ── Data rows ──
+   int row1Y  = sepY + 20;
+   int row2Y  = row1Y  + sp;
+   int row3Y  = row2Y  + sp;
+   int row4Y  = row3Y  + sp;
+   int row5Y  = row4Y  + sp;
+   int row6Y  = row5Y  + sp;
+   int row7Y  = row6Y  + sp;
+   int row8Y  = row7Y  + sp;
+   int row9Y  = row8Y  + sp;
+   int row10Y = row9Y  + sp;
+   int valX   = x + 250;
+
+   string accountStr  = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+   string balanceStr  = "$" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2);
+   string equityStr   = "$" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2);
+   string leverageStr = "1:" + IntegerToString(AccountInfoInteger(ACCOUNT_LEVERAGE));
+   string startBalStr = "$" + DoubleToString(g_startOfDayBalance, 2);
+
+   // Row 1: Account Number
+   CreateLabel("MP_LBL_ACCOUNT",   "Account Number:",      x + 20, row1Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_ACCOUNT",   accountStr,              valX,   row1Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 2: Balance
+   CreateLabel("MP_LBL_BALANCE",   "Balance:",             x + 20, row2Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_BALANCE",   balanceStr,              valX,   row2Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 3: Equity
+   CreateLabel("MP_LBL_EQUITY",    "Equity:",              x + 20, row3Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_EQUITY",    equityStr,               valX,   row3Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 4: Leverage
+   CreateLabel("MP_LBL_LEVERAGE",  "Leverage:",            x + 20, row4Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_LEVERAGE",  leverageStr,             valX,   row4Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 5: Open Positions
+   CreateLabel("MP_LBL_POSITIONS", "Open Positions:",      x + 20, row5Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_POSITIONS", "0",                     valX,   row5Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 6: Floating P/L
+   CreateLabel("MP_LBL_FLOATING",  "Floating P/L:",        x + 20, row6Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_FLOATING",  "$0.00",                 valX,   row6Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 7: Margin Used
+   CreateLabel("MP_LBL_MARGIN",    "Margin Used:",         x + 20, row7Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_MARGIN",    "$0.00",                 valX,   row7Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 8: Daily Starting Balance
+   CreateLabel("MP_LBL_STARTBAL",  "Daily Starting Bal:",  x + 20, row8Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_STARTBAL",  startBalStr,             valX,   row8Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 9: Daily P/L
+   CreateLabel("MP_LBL_DAILY",     "Daily P/L:",           x + 20, row9Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_DAILY",     "$0.00",                 valX,   row9Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // Row 10: Daily %
+   CreateLabel("MP_LBL_DAILYPCT",  "Daily %:",             x + 20, row10Y, InpDashLabelColor, InpDashLabelSize, InpDashFont);
+   CreateLabel("MP_VAL_DAILYPCT",  "0.00%",                 valX,   row10Y, InpDashValueColor, InpDashLabelSize, InpDashFont + " Bold");
+
+   // ── Close All Button ──
+   int btnY = row10Y + sp + 15;
+
+   if(ObjectFind(0, "MP_BTN_CLOSEALL") >= 0) ObjectDelete(0, "MP_BTN_CLOSEALL");
+   ObjectCreate(0, "MP_BTN_CLOSEALL", OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, "MP_BTN_CLOSEALL", OBJPROP_XDISTANCE, x + 20);
+   ObjectSetInteger(0, "MP_BTN_CLOSEALL", OBJPROP_YDISTANCE, btnY);
+   ObjectSetInteger(0, "MP_BTN_CLOSEALL", OBJPROP_XSIZE,     200);
+   ObjectSetInteger(0, "MP_BTN_CLOSEALL", OBJPROP_YSIZE,     35);
+   ObjectSetInteger(0, "MP_BTN_CLOSEALL", OBJPROP_BGCOLOR,   clrDarkRed);
+   ObjectSetInteger(0, "MP_BTN_CLOSEALL", OBJPROP_COLOR,     clrWhite);
+   ObjectSetInteger(0, "MP_BTN_CLOSEALL", OBJPROP_FONTSIZE,  12);
+   ObjectSetString(0, "MP_BTN_CLOSEALL", OBJPROP_FONT,       InpDashFont + " Bold");
+   ObjectSetString(0, "MP_BTN_CLOSEALL", OBJPROP_TEXT,        "CLOSE ALL");
+   ObjectSetInteger(0, "MP_BTN_CLOSEALL", OBJPROP_CORNER,    CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, "MP_BTN_CLOSEALL", OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, "MP_BTN_CLOSEALL", OBJPROP_BACK,      false);
+}
+
+void UpdateDashboard()
+{
+   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
+   double margin     = AccountInfoDouble(ACCOUNT_MARGIN);
+   double floatingPL = GetTotalFloatingPL();
+   double dailyPL    = (balance - g_startOfDayBalance) + floatingPL;
+   int    positions  = PositionsTotal();
+
+   // Daily % = ((current equity - starting balance) / starting balance) * 100
+   double dailyPct = 0;
+   if(g_startOfDayBalance > 0)
+      dailyPct = ((equity - g_startOfDayBalance) / g_startOfDayBalance) * 100.0;
+
+   // Account Number
+   ObjectSetString(0, "MP_VAL_ACCOUNT", OBJPROP_TEXT, IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)));
+
+   // Balance
+   ObjectSetString(0, "MP_VAL_BALANCE", OBJPROP_TEXT, "$" + DoubleToString(balance, 2));
+
+   // Equity
+   ObjectSetString(0, "MP_VAL_EQUITY", OBJPROP_TEXT, "$" + DoubleToString(equity, 2));
+   ObjectSetInteger(0, "MP_VAL_EQUITY", OBJPROP_COLOR, equity >= balance ? clrLime : clrRed);
+
+   // Leverage
+   ObjectSetString(0, "MP_VAL_LEVERAGE", OBJPROP_TEXT, "1:" + IntegerToString(AccountInfoInteger(ACCOUNT_LEVERAGE)));
+
+   // Open Positions
+   ObjectSetString(0, "MP_VAL_POSITIONS", OBJPROP_TEXT, IntegerToString(positions));
+   ObjectSetInteger(0, "MP_VAL_POSITIONS", OBJPROP_COLOR, positions > 0 ? clrOrange : InpDashValueColor);
+
+   // Floating P/L
+   string floatStr = (floatingPL >= 0 ? "+$" : "-$") + DoubleToString(MathAbs(floatingPL), 2);
+   ObjectSetString(0, "MP_VAL_FLOATING", OBJPROP_TEXT, floatStr);
+   ObjectSetInteger(0, "MP_VAL_FLOATING", OBJPROP_COLOR, floatingPL >= 0 ? clrLime : clrRed);
+
+   // Margin Used
+   ObjectSetString(0, "MP_VAL_MARGIN", OBJPROP_TEXT, "$" + DoubleToString(margin, 2));
+
+   // Daily Starting Balance
+   ObjectSetString(0, "MP_VAL_STARTBAL", OBJPROP_TEXT, "$" + DoubleToString(g_startOfDayBalance, 2));
+
+   // Daily P/L
+   string dailyStr = (dailyPL >= 0 ? "+$" : "-$") + DoubleToString(MathAbs(dailyPL), 2);
+   ObjectSetString(0, "MP_VAL_DAILY", OBJPROP_TEXT, dailyStr);
+   ObjectSetInteger(0, "MP_VAL_DAILY", OBJPROP_COLOR, dailyPL >= 0 ? clrLime : clrRed);
+
+   // Daily %
+   string pctStr = (dailyPct >= 0 ? "+" : "") + DoubleToString(dailyPct, 2) + "%";
+   ObjectSetString(0, "MP_VAL_DAILYPCT", OBJPROP_TEXT, pctStr);
+   ObjectSetInteger(0, "MP_VAL_DAILYPCT", OBJPROP_COLOR, dailyPct >= 0 ? clrLime : clrRed);
+
+   ChartRedraw(0);
+}
+
+void DeleteDashboard()
+{
+   string objects[] = {
+      "MP_BG", "MP_TITLE", "MP_SEP1",
+      "MP_LBL_ACCOUNT",   "MP_VAL_ACCOUNT",
+      "MP_LBL_BALANCE",   "MP_VAL_BALANCE",
+      "MP_LBL_EQUITY",    "MP_VAL_EQUITY",
+      "MP_LBL_LEVERAGE",  "MP_VAL_LEVERAGE",
+      "MP_LBL_POSITIONS", "MP_VAL_POSITIONS",
+      "MP_LBL_FLOATING",  "MP_VAL_FLOATING",
+      "MP_LBL_MARGIN",    "MP_VAL_MARGIN",
+      "MP_LBL_STARTBAL",  "MP_VAL_STARTBAL",
+      "MP_LBL_DAILY",     "MP_VAL_DAILY",
+      "MP_LBL_DAILYPCT",  "MP_VAL_DAILYPCT",
+      "MP_BTN_CLOSEALL"
+   };
+
+   for(int i = 0; i < ArraySize(objects); i++)
+      ObjectDelete(0, objects[i]);
+}
+
+void CreateLabel(string name, string text, int x, int y, color clr, int size, string font)
+{
+   if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+   ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,     clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  size);
+   ObjectSetString(0, name, OBJPROP_FONT,       font);
+   ObjectSetString(0, name, OBJPROP_TEXT,        text);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR,    ANCHOR_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_BACK,      false);
+}
